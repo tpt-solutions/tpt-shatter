@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Secrets and key material
+*.pem
+*.key
+*.p12
+.env
+.env.*
+secrets/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# Local data
+*.profraw
+*.db
+/data/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

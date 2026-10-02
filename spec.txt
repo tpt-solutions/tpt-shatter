@@ -1,0 +1,331 @@
+# `tpt-shatter` — System Design Specification
+
+> **Version:** 1.0.0-draft  
+> **Date:** 2026-09-28  
+> **Status:** Design Phase  
+> **Philosophy:** *Assume breach. Never store data whole. Never persist sensitive payloads. Flood the zone with fakes. Zero heavy cryptographic payload overhead.*
+
+---
+
+## 1. Overview
+
+`tpt-shatter` is a data security architecture that provides confidentiality and integrity **without relying on payload-level encryption** (e.g., AES, RSA). Instead, it achieves security through **data fragmentation (shattering)**, **ephemeral in-memory processing**, **strict network isolation**, **capability-based access control**, **decoy injection (honeypots)**, and **anonymized analytical sinks**.
+
+The system assumes that an attacker **will** eventually penetrate the perimeter, compromise a database, or dump a disk. The architecture ensures that such a breach yields only meaningless fragments, fake data, or already-expired tokens. 
+
+Critically, this system is built entirely on the **TPT ecosystem**, leveraging `tpt-keystone-db` for isolated fragment storage and `tpt-strata` for zero-dependency, embeddable analytics, eliminating the operational and computational overhead of external database stacks.
+
+---
+
+## 2. Core Principles
+
+| # | Principle | Rationale |
+|---|-----------|-----------|
+| 1 | **Never store data whole** | A breached database contains only useless, disconnected fragments. |
+| 2 | **Never write sensitive data to disk** | Sensitive payloads exist only in RAM for milliseconds, then are securely zeroed. |
+| 3 | **Flood the zone with fakes** | High-value records an attacker finds are canary decoys that trigger silent, immediate alarms. |
+| 4 | **No passwords, only capabilities** | Access is granted by short-lived, unguessable tokens, not by identity assertions that can be replayed or stolen. |
+| 5 | **Separate operational from analytical** | Real-time data is shattered; analytics are pre-aggregated, anonymized, and processed in-process. |
+| 6 | **Zero cryptographic payload overhead** | No heavy encryption/decryption cycles. Lightweight HMAC is used *only* for token signing, not data obfuscation. |
+
+---
+
+## 3. Repository Structure
+
+```text
+tpt-shatter/
+├── Cargo.toml                          # Workspace root
+├── DESIGN.md                           # This document
+├── crates/
+│   ├── tpt-shatter-common/             # Shared types, traits, error definitions
+│   ├── tpt-shatter-token/              # Capability token generation & validation
+│   ├── tpt-shatter-gateway/            # API gateway, token validation, rate limiting
+│   ├── tpt-shatter-shredder/           # Data fragmentation engine
+│   ├── tpt-shatter-assembler/          # Ephemeral in-memory reconstructor
+│   ├── tpt-shatter-emitter/            # Event emitter (anonymization + aggregation)
+│   ├── tpt-shatter-canary/             # Honeypot/honeytoken injection & detection
+│   ├── tpt-shatter-anonymize/          # Anonymization utilities (bucketing, noise, k-anonymity)
+│   └── tpt-shatter-vault-client/       # Shared client for communicating with isolated vaults
+├── vaults/
+│   ├── vault-frag-a/                   # Isolated tpt-keystone-db instance: Identity fragments
+│   ├── vault-frag-b/                   # Isolated tpt-keystone-db instance: Demographic fragments
+│   └── vault-frag-c/                   # Isolated tpt-keystone-db instance: Financial/sensitive fragments
+├── insight-vault/                      # Embedded tpt-strata columnar engine (Analytics sink)
+├── infrastructure/
+│   ├── terraform/                      # Network isolation, VPCs, security groups
+│   ├── k8s/                            # Kubernetes manifests (tmpfs volumes, distroless images)
+│   └── policies/                       # OPA / network policies
+└── tests/
+    ├── integration/                    # End-to-end tests with synthetic data
+    └── canary/                         # Canary detection verification tests
+
+4. Crate Specifications
+4.1 tpt-shatter-common
+Shared foundation crate. No business logic.
+Contents: FragmentId (opaque linking ID), ShardKey (routing key), CapabilityToken (parsed token struct), ShatterError (unified error enum), SecureZero trait (for memory wiping).
+Dependencies: zeroize, serde, thiserror.
+4.2 tpt-shatter-token
+Handles generation and validation of short-lived capability tokens.
+Responsibilities: Generate 256-bit entropy tokens; sign with lightweight HMAC-SHA256; enforce strict TTL (default: 60s); bind tokens to specific ShardKey and action scopes.
+Design Notes: Tokens are stateless. No session store. HMAC is used only for integrity, not data encryption (microsecond overhead).
+Dependencies: hmac, sha2, rand, tpt-shatter-common.
+4.3 tpt-shatter-gateway
+The single public-facing entry point.
+Responsibilities: Accept HTTP/gRPC requests; validate tokens via tpt-shatter-token; enforce rate limiting; route validated requests to the assembler; return responses.
+Security Posture: Runs in a DMZ. Has no network access to any vault. Logs only token hashes and metadata.
+Dependencies: axum or tonic, tpt-shatter-token, tpt-shatter-common.
+4.4 tpt-shatter-shredder
+The data fragmentation engine.
+Responsibilities: Accept complete data records; split into N fragments per a configurable shatter schema; assign a deterministically derived FragmentId; dispatch to respective vaults via tpt-shatter-vault-client; securely zero the original record from memory.
+Critical Rule: The shredder does not store a mapping table. The FragmentId is derived via a one-way hash, allowing the assembler to re-derive it without a lookup table.
+Dependencies: tpt-shatter-vault-client, tpt-shatter-common, zeroize.
+4.5 tpt-shatter-assembler
+The ephemeral reconstructor. The most security-critical component.
+Responsibilities: Receive request from gateway; derive FragmentId; fetch fragments from all N vaults in parallel; reconstruct the complete record in RAM only; pass to emitter; return to gateway; securely zero all memory.
+Memory Safety Guarantees: All sensitive structs implement SecureZero. Uses the zeroize crate. Runs on tmpfs with OS-level swap disabled (swapoff -a) and mlock enabled to prevent page swapping.
+Dependencies: tokio, tpt-shatter-vault-client, tpt-shatter-emitter, tpt-shatter-common, zeroize.
+4.6 tpt-shatter-emitter
+The analytics event pipeline.
+Responsibilities: Receive reconstructed record in RAM; apply anonymization transforms via tpt-shatter-anonymize; emit the anonymized event directly into the embedded tpt-strata engine; signal the assembler to zero the record.
+Dependencies: tpt-shatter-anonymize, tpt-shatter-common, tpt-strata.
+4.7 tpt-shatter-anonymize
+Pure-function anonymization utilities. No I/O.
+Functions: bucket() (categorical ranges), pseudonymize() (one-way SHA-256 with static salt), add_noise() (Laplace mechanism for differential privacy), check_k_anonymity() (gate to prevent small-cohort emissions), mask() (UI display masking).
+Dependencies: sha2, rand, tpt-shatter-common.
+4.8 tpt-shatter-canary
+The honeypot and alarm system.
+Responsibilities: Periodically inject synthetic "high-value" canary records into all vaults (using a deterministic prefix known only to this service). Monitor vault query logs. If a canary FragmentId is queried, trigger an alarm, rotate the gateway's HMAC signing key (instantly invalidating all active tokens), and notify security.
+Dependencies: tpt-shatter-vault-client, tpt-shatter-common, tpt-shatter-token.
+4.9 tpt-shatter-vault-client
+Shared client library for communicating with isolated vault databases.
+Responsibilities: Provide typed read/write operations for each vault schema. Handle connection pooling. Enforce that queries can only target a single vault (no cross-vault joins at the client level).
+Dependencies: tpt-keystone-db (native Rust API or wire protocol client), tpt-shatter-common.
+5. Data Flow
+5.1 Write Path (Ingestion)
+
+[External Source]
+       │
+       ▼
+[tpt-shatter-shredder]
+  1. Receives complete record
+  2. Derives FragmentId
+  3. Splits into N fragments
+  4. Dispatches to vaults (parallel)
+  5. Zeroes original record from RAM
+       │
+       ├──► [vault-frag-a] (tpt-keystone-db: Identity fragment)
+       ├──► [vault-frag-b] (tpt-keystone-db: Demographic fragment)
+       └──► [vault-frag-c] (tpt-keystone-db: Financial fragment)
+
+5.2 Read Path (Client Request)
+
+[Client]
+   │
+   ▼
+[tpt-shatter-gateway]
+  1. Validates capability token (HMAC, TTL, scope)
+  2. Rate-limit check
+  3. Forwards ShardKey to assembler
+       │
+       ▼
+[tpt-shatter-assembler] (RAM only, no disk, no swap)
+  1. Derives FragmentId from ShardKey
+  2. Fetches fragments from all vaults (parallel)
+  3. Reconstructs record in RAM
+  4. Passes to emitter ──────────► [tpt-shatter-emitter]
+  5. Returns record to gateway       │
+  6. Securely zeroes RAM             ▼
+       │                      [tpt-shatter-anonymize]
+       ▼                         │
+[tpt-shatter-gateway]            ▼
+  7. Returns response      [tpt-strata] (Embedded, zero-dependency columnar sink)
+       │                    (Aggregated, anonymized)
+       ▼
+   [Client]
+
+5.3 Canary Detection Path
+
+[Attacker queries vault]
+       │
+       ▼
+[Vault query log]
+       │
+       ▼
+[tpt-shatter-canary] (monitoring)
+  1. Detects canary FragmentId in query
+  2. Triggers alarm
+  3. Signals gateway to rotate HMAC key
+  4. All active tokens instantly invalidated
+  5. Security team notified
+
+6. Infrastructure & Deployment Requirements
+6.1 Network Isolation
+
+Component
+Network Segment
+Inbound
+Outbound
+gateway
+DMZ
+Internet
+Assembler only
+assembler
+Private (isolated)
+Gateway only
+Vaults, Emitter
+shredder
+Private (isolated)
+Ingestion pipeline only
+Vaults
+vault-frag-a/b/c
+Vault subnets (isolated from each other)
+Assembler, Shredder, Canary only
+None
+canary
+Management subnet
+None
+All vaults, Gateway
+insight-vault
+Analytics subnet
+Emitter only
+BI tools
+6.2 Assembler Host Hardening
+OS: Minimal Linux (Distroless or Alpine container).
+Swap: Disabled (swapoff -a).
+Filesystem: Root on tmpfs. No persistent volumes mounted.
+Memory: mlock enabled (CAP_IPC_LOCK) to prevent page swapping.
+Image: Statically linked Rust binary. No shell, no curl, no debugging tools.
+6.3 Vault Configuration (tpt-keystone-db)
+Each vault runs as an isolated instance of tpt-keystone-db.
+Leverages Keystone’s native disaggregated storage (S3/local-fs with NVMe cache-aside) and LSM-tree/B-Tree indexes for fast, lightweight fragment retrieval.
+Opt-in SCRAM-SHA-256 and TLS enforced between assembler and vaults.
+No replication between vaults. Automated backups per vault (backups contain only fragments).
+6.4 Analytics Configuration (tpt-strata)
+Runs embedded within the tpt-shatter-emitter process or as a lightweight sidecar.
+Zero external dependencies. Uses tpt-strata's native columnar format or tpt-strata-parquet bridge.
+Provides blazing-fast, in-process aggregation (sum, group by) over anonymized data without the overhead of a JVM or external server process.
+7. Security Model
+7.1 Threat Model
+Threat
+Mitigation
+Attacker breaches a single vault
+Data is fragmented; one vault alone is meaningless.
+Attacker breaches all vaults
+Fragments are linked by FragmentId, not real IDs. Reassembly requires the assembler's derivation logic. Canary records pollute the dataset.
+Attacker dumps assembler disk
+No disk. tmpfs only.
+Attacker dumps assembler RAM
+Window of exposure is milliseconds. zeroize overwrites on drop. mlock prevents swap.
+Attacker steals a capability token
+Token expires in 60s. Bound to specific scope.
+Attacker queries analytics DB
+Data is anonymized, bucketed, noisy, and k-anonymous. No PII.
+Insider threat (developer)
+No single person has access to all vaults simultaneously. Assembler has no shell. Canary detects unauthorized queries.
+7.2 What We Do NOT Protect Against
+Threat
+Reason
+Attacker with root access to assembler host during active request
+They could dump RAM in the millisecond window. Mitigated by host hardening and minimal attack surface.
+Compromised HMAC signing key
+All tokens become forgeable. Mitigated by short TTL and canary-triggered key rotation.
+Side-channel attacks (timing, power)
+Out of scope for software architecture. Requires hardware-level mitigation.
+8. Observability & Logging
+Critical Rule: No component may log sensitive data, payloads, fragments, or reconstructed records.
+What is Logged
+What is NEVER Logged
+Request timestamps
+Payloads
+Token hashes (not tokens)
+Fragment contents
+ShardKey hashes
+User identifiers
+Error codes
+Database query results
+Canary alarm events
+Canary record values
+Latency metrics
+Field values
+Vault connection status
+FragmentIds in plaintext
+Stack: Structured JSON logs → OpenTelemetry → Observability backend (Grafana/Datadog).
+9. Testing Strategy
+Test Type
+Approach
+Unit tests
+All crates tested with synthetic data. tpt-shatter-anonymize is pure functions — fully testable.
+Integration tests
+Full pipeline with synthetic records. Verify fragments land in correct tpt-keystone-db vaults. Verify assembler reconstructs correctly. Verify emitter writes to tpt-strata.
+Canary tests
+Inject canary, query it, verify alarm fires and tokens are revoked.
+Memory safety tests
+Verify zeroize is called. Use custom allocators in test mode to assert memory is zeroed after drop.
+Chaos tests
+Kill assembler mid-request. Verify no partial data persists. Kill a vault. Verify graceful degradation.
+Penetration tests
+Attempt cross-vault queries. Attempt token replay. Attempt to extract data from assembler disk image.
+10. Known Gaps & Open Questions
+The following areas require further design discussion before implementation:
+#
+Gap
+Notes
+1
+Disaster Recovery
+If all vaults are destroyed simultaneously, data is lost. Fragmented backups exist per vault, but reassembly requires the derivation logic. Need a formal DR plan.
+2
+Inter-Vault Consistency
+If vault-a writes succeed but vault-b fails, we have orphaned fragments. Need a saga/compensation pattern.
+3
+Data Retention & Deletion (GDPR)
+"Right to be forgotten" requires deleting all fragments for a user. Need a deletion orchestrator that targets all vaults by FragmentId.
+4
+Schema Evolution
+If the shatter schema changes (e.g., adding a 4th fragment), how do we migrate existing data across isolated Keystone instances?
+5
+HMAC Key Provisioning
+The HMAC key for token signing lives in gateway RAM. How is it initially provisioned and rotated securely?
+6
+Audit Trail
+Without logging payloads, how do we produce compliance audit logs proving data was accessed legitimately?
+11. Compliance Notes
+Regulation
+How tpt-shatter Helps
+GDPR
+Data minimization by design. Pseudonymization in analytics. Right to erasure = delete fragments by FragmentId across all vaults.
+PCI-DSS
+Card data is shattered into fragments. No single tpt-keystone-db instance holds a full PAN.
+HIPAA
+PHI is fragmented. Analytics sink (tpt-strata) is de-identified per Safe Harbor method.
+SOC 2
+Canary system provides breach detection. Capability tokens provide access control evidence.
+12. Technology Stack (TPT-Native)
+Layer
+Technology
+Language
+Rust
+Web Framework
+axum (gateway), tonic (internal gRPC)
+Fragment Storage
+tpt-keystone-db (isolated instances per fragment type)
+Analytics Sink
+tpt-strata + tpt-strata-parquet (embedded, zero-dependency)
+Memory Zeroing
+zeroize crate
+Serialization
+serde + serde_json
+Infrastructure
+Terraform + Kubernetes
+Container Images
+Distroless (Google)
+Observability
+OpenTelemetry + Grafana
+Policy Engine
+OPA (Open Policy Agent)
+13. Versioning & Changelog
+Version
+Date
+Notes
+1.0.0-draft
+2026-09-28
+Initial unified design specification integrating tpt-keystone-db and tpt-strata.
