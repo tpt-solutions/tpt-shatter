@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "tpt-shatter-gateway"
+description = "tpt-shatter: gateway crate (scaffold)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+# Nothing in this workspace is published to crates.io.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = "0.11.0"
+tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
+tpt-shatter-token = { version = "0.1.0", path = "../tpt-shatter-token" }
+tpt-shatter-canary = { version = "0.1.0", path = "../tpt-shatter-canary" }

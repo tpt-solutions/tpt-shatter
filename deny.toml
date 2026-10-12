@@ -1,0 +1,35 @@
+# cargo-deny configuration. Policy: linked crates must be MIT-compatible.
+# Bare "Apache-2.0" is intentionally absent from the allow-list, so Apache-only
+# crates are rejected. Dual "MIT OR Apache-2.0" crates pass via their MIT option.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Parquet/Arrow are Apache-2.0 only and the tpt-strata-parquet bridge is dropped (see UPSTREAM.md).
+deny = [
+    { crate = "parquet", reason = "Apache-2.0 only; Parquet bridge dropped (see UPSTREAM.md)" },
+    { crate = "arrow", reason = "Apache-2.0 only; Parquet bridge dropped (see UPSTREAM.md)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

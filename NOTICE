@@ -1,0 +1,8 @@
+tpt-shatter
+Copyright 2026 TPT Solutions
+
+This product is licensed under either of the MIT license (LICENSE-MIT) or the
+Apache License, Version 2.0 (LICENSE-APACHE), at your option.
+
+Third-party dependencies retain their own licenses; see the output of
+`cargo deny check` and the attribution notices generated for releases.

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "tpt-shatter-token"
+description = "tpt-shatter: token crate (scaffold)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+# Nothing in this workspace is published to crates.io.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+hmac = "0.13.0"
+rand = "0.10.3"
+sha2 = "0.11.0"
+tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+proptest = "1.11.0"
