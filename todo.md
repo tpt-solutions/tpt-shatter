@@ -9,10 +9,10 @@ Rule: no linked dependency may be Apache-2.0-only (MIT, dual MIT/Apache, BSD, IS
 Resolve these before the implementation phases that depend on them.
 
 ### Licensing policy
-- [ ] Confirm license policy: linked Rust crates only; deploy-time tools (OPA, Distroless, Terraform) exempt
-- [ ] Write allow-list of acceptable licenses (MIT, BSD-2/3, ISC, Unlicense, Zlib, MIT/Apache-2.0 dual, etc.)
-- [ ] List spec items that are Apache-only and decide replacements (OpenTelemetry Rust crates -> MIT alternative, e.g. `tracing` + JSON logs + OTLP exporter alternative)
-- [ ] Audit licenses of planned deps: axum, tonic, tokio, hmac, sha2, rand, zeroize, serde, thiserror, prost (check each)
+- [x] Confirm license policy: linked Rust crates only; deploy-time tools (OPA, Distroless, Terraform) exempt (see DECISIONS.md)
+- [x] Write allow-list of acceptable licenses (MIT, BSD-2/3, ISC, Unlicense, Zlib, MIT/Apache-2.0 dual, etc.) (`deny.toml`)
+- [x] List spec items that are Apache-only and decide replacements (DECISIONS.md: axum -> hyper, tonic/prost -> HTTP/JSON, parquet/arrow dropped; OpenTelemetry deferred, `tracing` chosen, DECISIONS.md Observability)
+- [ ] Audit licenses of planned deps: axum, tonic, tokio, hmac, sha2, rand, zeroize, serde, thiserror, prost (check each) — PARTIAL: checked with `cargo info` and `cargo deny`; `rand` not yet used
 - [x] Verify `tpt-keystone-db` license is compatible (GitHub)
 - [x] Verify `tpt-strata` and `tpt-strata-parquet` licenses are compatible (GitHub)
 - [x] Verify Parquet-related transitive deps (arrow/parquet crates are Apache-only?) and decide whether `tpt-strata-parquet` can be used
@@ -21,29 +21,29 @@ Resolve these before the implementation phases that depend on them.
 - [x] Record GitHub URLs, commit/tag pins for tpt-keystone-db and tpt-strata
 - [x] Review tpt-keystone-db Rust API / wire protocol; choose native API vs wire client
 - [x] Confirm keystone supports SCRAM-SHA-256 + TLS as the spec assumes (supported but opt-in; deployment config must enable it)
-- [ ] Confirm keystone exposes a query log / audit hook the canary can tail; if not, file/implement the feature upstream (open: audit log exists, tailability not verified)
-- [ ] Review tpt-strata embedding API (in-process ingest, group by, sum) and its durability model (open: API and durability not yet reviewed)
+- [ ] Confirm keystone exposes a query log / audit hook the canary can tail; if not, file/implement the feature upstream — PARTIAL: audit log is table `_mirror_audit`, readable by polling; no stream; query text capture unverified (UPSTREAM.md)
+- [ ] Review tpt-strata embedding API (in-process ingest, group by, sum) and its durability model — PARTIAL: `Table`/`QueryBuilder` found; group-by/sum names and durability not documented upstream (UPSTREAM.md); decided JSONL is the durable copy (DECISIONS.md)
 - [x] Confirm tpt-strata never needs a separate server process
 
 ### Open gaps from spec section 10 (design decisions)
-- [ ] Gap 1: Disaster recovery plan (per-vault backups, derivation key escrow, restore drills, RPO/RTO)
-- [ ] Gap 2: Inter-vault consistency (saga/compensation pattern, orphan fragment reaper, write ordering)
-- [ ] Gap 3: GDPR deletion orchestrator design (delete by FragmentId across all vaults, verification, backup handling)
-- [ ] Gap 4: Schema evolution / re-shatter migration (e.g. adding a 4th fragment, versioned shatter schema)
-- [ ] Gap 5: HMAC key provisioning and rotation (token key + FragmentId derivation key, bootstrap, secret source, split custody)
-- [ ] Gap 6: Audit trail without payload logging (what proves legitimate access, hashed-only entries, tamper evidence)
+- [x] Gap 1: Disaster recovery plan (per-vault backups, derivation key escrow, restore drills, RPO/RTO) — decided in DECISIONS.md; runbook and drills pending (Phase 11)
+- [x] Gap 2: Inter-vault consistency (saga/compensation pattern, orphan fragment reaper, write ordering) — decided; saga done, reaper pending (Phase 6)
+- [x] Gap 3: GDPR deletion orchestrator design (delete by FragmentId across all vaults, verification, backup handling) — decided; orchestrator done
+- [x] Gap 4: Schema evolution / re-shatter migration (e.g. adding a 4th fragment, versioned shatter schema) — decided; migration tool pending (Phase 11)
+- [x] Gap 5: HMAC key provisioning and rotation (token key + FragmentId derivation key, bootstrap, secret source, split custody) — decided; provisioning pending (Phase 11)
+- [x] Gap 6: Audit trail without payload logging (what proves legitimate access, hashed-only entries, tamper evidence) — decided; `AuditChain` built
 
 ### Core design decisions
-- [ ] Finalize shatter schema: which fields go to vault A (identity), B (demographic), C (financial)
-- [ ] Finalize FragmentId derivation: keyed HMAC-SHA256 of ShardKey + vault label (domain separation per vault)
-- [ ] Define ShardKey format and entropy requirements
-- [ ] Define token format: fields, scopes/actions, TTL (default 60s), encoding, signature
-- [ ] Define token issuer service contract (upstream auth out of scope)
-- [ ] Define canary record prefix scheme and how it stays secret
-- [ ] Define mTLS identity scheme between internal services
-- [ ] Define alarm response: key rotation propagation to gateway/issuer, security notification channel
-- [ ] Define k-anonymity threshold, noise epsilon, bucketing rules for analytics
-- [ ] Add threat-model addenda for decisions above (update spec section 7)
+- [x] Finalize shatter schema: which fields go to vault A (identity), B (demographic), C (financial) (DECISIONS.md, config-driven)
+- [x] Finalize FragmentId derivation: keyed HMAC-SHA256 of ShardKey + vault label (domain separation per vault)
+- [x] Define ShardKey format and entropy requirements (256-bit CSPRNG, 64 hex chars)
+- [x] Define token format: fields, scopes/actions, TTL (default 60s), encoding, signature
+- [x] Define token issuer service contract (upstream auth out of scope) (DECISIONS.md; endpoint pending in Phase 4)
+- [x] Define canary record prefix scheme and how it stays secret (HMAC-derived prefix, DECISIONS.md)
+- [ ] Define mTLS identity scheme between internal services — PARTIAL: scheme recorded in DECISIONS.md; TLS/mTLS now built on rustls + graviola (no exception needed); certificate issuance pending
+- [ ] Define alarm response: key rotation propagation to gateway/issuer, security notification channel — PARTIAL: recorded in DECISIONS.md; propagation and channel not built
+- [x] Define k-anonymity threshold, noise epsilon, bucketing rules for analytics (k=10, epsilon 1.0, DECISIONS.md)
+- [ ] Add threat-model addenda for decisions above (update spec section 7) — PARTIAL: decisions recorded in DECISIONS.md; DESIGN.md section 7 not yet updated
 
 ---
 
@@ -55,7 +55,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Add `NOTICE` file
 - [x] Add license section to `README.md`
 - [x] Add SPDX headers convention (`MIT OR Apache-2.0`) and enforce it
-- [ ] Rename/move `spec.txt` -> `DESIGN.md` (renamed; markdown table reflow still pending)
+- [x] Rename/move `spec.txt` -> `DESIGN.md` (markdown table reflow still pending, tracked separately)
 - [x] Create `.gitignore`, `rust-toolchain.toml`, `rustfmt.toml`, clippy config
 - [x] Scaffold 9 crates under `crates/`: common, token, gateway, shredder, assembler, emitter, canary, anonymize, vault-client
 - [x] Scaffold directories: `vaults/vault-frag-{a,b,c}`, `insight-vault/`, `infrastructure/{terraform,k8s,policies}`, `tests/{integration,canary}`
@@ -84,7 +84,7 @@ Resolve these before the implementation phases that depend on them.
 
 ## Phase 3 — `tpt-shatter-anonymize`
 - [x] `bucket()` categorical range bucketing
-- [x] `pseudonymize()` one-way SHA-256 with static salt (done; salt provisioning and rotation notes still pending)
+- [x] `pseudonymize()` one-way SHA-256 with static salt (done; salt provisioning and rotation decided in DECISIONS.md, rotation tooling pending)
 - [x] `add_noise()` Laplace mechanism (differential privacy, configurable epsilon)
 - [x] `check_k_anonymity()` small-cohort gate
 - [x] `mask()` UI display masking
@@ -129,7 +129,7 @@ Resolve these before the implementation phases that depend on them.
 ---
 
 ## Phase 6 — `tpt-shatter-shredder`
-- [ ] Configurable shatter schema loader (versioned) — PARTIAL: serde deserialization exists; file loader pending
+- [ ] Configurable shatter schema loader (versioned) — PARTIAL: JSON loader done (`ShatterSchema::load_json_file` in common); shredder wiring and other formats pending
 - [x] Split record into N fragments per schema
 - [x] FragmentId derivation (keyed HMAC, per-vault domain separation), no mapping table
 - [x] Parallel dispatch to vaults via vault-client
@@ -138,7 +138,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Securely zero original record after dispatch
 - [ ] Internal gRPC (tonic) ingestion service with mTLS — PARTIAL: pending: needs tonic and mTLS
 - [ ] Derivation key loading (RAM only, from provisioning mechanism) — PARTIAL: caller supplies key; RAM-only provisioning pending (Phase 11)
-- [ ] Orphan fragment reaper (background) — PARTIAL: pending; compensation failures are left for it
+- [ ] Orphan fragment reaper (background) — PARTIAL: `Shredder::reap` with bounded retries and abandonment (tested); orphan queue is durable via `Shredder::with_orphan_log` (atomic rewrite, restart test); attempt counts reset on restart; no background task yet; abandoned orphans cannot be located again (the queue holds FragmentIds, not ShardKeys) and raise no alarm yet
 - [x] Unit + integration tests with synthetic records
 - [x] Docs + license headers
 
@@ -164,10 +164,10 @@ Resolve these before the implementation phases that depend on them.
 ## Phase 8 — `tpt-shatter-emitter` & `insight-vault`
 - [x] Apply anonymization transforms (bucket, pseudonymize, noise)
 - [x] k-anonymity gate before emit
-- [ ] Emit to embedded tpt-strata engine — PARTIAL: sink trait only; strata adapter pending API review
+- [ ] Emit to embedded tpt-strata engine — PARTIAL: `EventSink` trait, `MemorySink`, and durable `JsonlSink` (fsynced, read-back) done; strata adapter pending upstream API confirmation
 - [x] Signal assembler to zero record after emit
 - [ ] `insight-vault/` setup: strata storage layout and schema for anonymized events — PARTIAL: pending
-- [ ] Decide embedded vs sidecar deployment for strata
+- [x] Decide embedded vs sidecar deployment for strata (embedded, DECISIONS.md)
 - [x] Decide on tpt-strata-parquet bridge: dropped (Apache-only deps; banned in deny.toml)
 - [ ] Sample aggregation queries (sum, group by) for BI access
 - [ ] Analytics subnet access path for BI tools (emitter-only inbound)
@@ -177,17 +177,17 @@ Resolve these before the implementation phases that depend on them.
 ---
 
 ## Phase 9 — `tpt-shatter-gateway`
-- [ ] axum HTTP/JSON server — PARTIAL: BLOCKED on license policy: axum pulls sync_wrapper (Apache-2.0 only); needs a policy decision
+- [x] HTTP/JSON server — hyper 1 (MIT) in `crates/tpt-shatter-gateway/src/http.rs`; axum avoided because it pulls sync_wrapper (Apache-only). TLS is separate (below)
 - [x] Capability token validation (HMAC, TTL, scope)
 - [ ] Rate limiting (per token hash / per source) — PARTIAL: per token hash done; per source address needs the HTTP layer
-- [ ] Route validated requests to the assembler (gRPC, mTLS) — PARTIAL: in-process RecordSource trait done; gRPC needs tonic, which pulls prost (Apache-2.0 only)
+- [ ] Route validated requests to the assembler (gRPC, mTLS) — PARTIAL: in-process RecordSource trait done; transport decided as HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md); assembler client and mTLS pending
 - [x] Return responses; uniform error responses that leak nothing
 - [x] Logs only token hashes and metadata
 - [x] Key rotation signal receiver (from canary) with instant effect
-- [ ] Health/readiness endpoints — PARTIAL: readiness logic done; HTTP endpoints wait on the HTTP layer
-- [ ] TLS termination config — PARTIAL: pending
+- [x] Health/readiness endpoints — `/healthz` and `/readyz` in `http.rs`, tested
+- [x] TLS termination config — `serve_tls` (TLS 1.3, optional mTLS) built on rustls 0.23 + rustls-graviola 0.2.1, tested with real handshakes (`tests/tls.rs`); cert issuance and rotation pending
 - [ ] Verify the gateway has no network path to any vault — PARTIAL: gateway has no vault-client dependency; network isolation is infrastructure work
-- [ ] Request size limits, timeouts, header hardening — PARTIAL: pending HTTP layer
+- [ ] Request size limits, timeouts, header hardening — PARTIAL: request-head size limit and per-request timeout done in `http.rs` (tested); body limits not needed for GET; no-store and nosniff headers set
 - [x] Docs + license headers
 
 ---
@@ -196,7 +196,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Canary record generator (synthetic high-value records, realistic-looking) — PARTIAL: structured records, not yet realistic
 - [x] Secret deterministic prefix scheme
 - [ ] Periodic injection into all vaults — PARTIAL: plan supports injection; scheduler pending
-- [ ] Canary refresh/rotation schedule
+- [ ] Canary refresh/rotation schedule — PARTIAL: epoch primitives done (`CanaryPlan::for_epoch`, `epoch_at`); scheduler that calls them and injects pending
 - [ ] Vault query-log tailer (per vault) — PARTIAL: pending
 - [ ] Detect canary FragmentId in query logs — PARTIAL: detection on supplied IDs done; log tailing pending
 - [x] Alarm: rotate HMAC signing key, invalidate all tokens — PARTIAL: via Responder trait; wiring to the token Signer pending
@@ -213,11 +213,11 @@ Resolve these before the implementation phases that depend on them.
 - [x] Deletion orchestrator service (delete by FragmentId across all vaults)
 - [x] Deletion verification and idempotency
 - [ ] Backup handling for erased subjects (expiry or tombstone replay on restore)
-- [ ] Retention policy enforcement (TTL on fragments)
+- [ ] Retention policy enforcement (TTL on fragments) — PARTIAL: `RetentionPolicy` done in common; purge job and vault TTL wiring pending
 
 ### Audit trail
-- [ ] Define audit event schema (who/what/when via token hash and shard hash, no payload)
-- [ ] Implement tamper-evident audit log (hash chain)
+- [x] Define audit event schema (who/what/when via token hash and shard hash, no payload)
+- [ ] Implement tamper-evident audit log (hash chain) — PARTIAL: keyed HMAC chain with verify/resume in common (in-memory); durable storage and export pending
 - [ ] Compliance export/report tooling
 
 ### Disaster recovery
@@ -226,7 +226,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Restore drill test
 
 ### Schema evolution
-- [ ] Schema version stored with fragments
+- [x] Schema version stored with fragments (4-byte header on every fragment; assembler refuses a mismatch, tested)
 - [ ] Re-shatter migration tool (read via assembler, write via shredder, verify, retire old)
 
 ### Key provisioning
@@ -256,7 +256,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Assembler: tmpfs root, no persistent volumes, swap disabled, `CAP_IPC_LOCK`, read-only root fs
 - [ ] NetworkPolicies matching the isolation table
 - [ ] Pod security: non-root, drop all caps (except required), seccomp
-- [ ] mTLS between internal services (cert provisioning)
+- [ ] mTLS between internal services (cert provisioning) — PARTIAL: mTLS listener built and tested (gateway `serve_tls` with client CA); provisioning and rotation pending
 - [ ] Vault StatefulSets with separate namespaces/nodes
 - [ ] Container build pipeline (static musl Rust binaries, no shell/curl)
 
@@ -274,7 +274,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Integration: assembler reconstructs record exactly
 - [ ] Integration: emitter writes to tpt-strata and output is anonymized — PARTIAL: checked against MemorySink; strata pending
 - [x] Canary tests: inject, query, alarm fires, tokens revoked (alarm path and revocation are tested separately, not in one end-to-end test)
-- [ ] Memory-safety tests: zeroize called; custom allocator asserts memory zeroed after drop
+- [ ] Memory-safety tests: zeroize called; custom allocator asserts memory zeroed after drop — PARTIAL: `Record` is `ZeroizeOnDrop` (compile-time test); allocator-level check pending (needs unsafe, out of policy)
 - [ ] Chaos: kill assembler mid-request, no partial data persists
 - [x] Chaos: kill one vault, graceful degradation
 - [x] Chaos: partial shred write, saga compensates
@@ -289,11 +289,11 @@ Resolve these before the implementation phases that depend on them.
 ---
 
 ## Phase 14 — Documentation, Compliance & Release
-- [ ] README (overview, quick start, license)
-- [ ] Update `DESIGN.md` with resolved gaps and final decisions
-- [ ] Operations runbook (deploy, rotate keys, canary alarm response, DR)
+- [x] README (overview, quick start, license)
+- [ ] Update `DESIGN.md` with resolved gaps and final decisions — PARTIAL: section 12 (stack) updated, section 12a summarizes decisions and threat-model addenda; section 10 gap table not yet marked resolved
+- [ ] Operations runbook (deploy, rotate keys, canary alarm response, DR) — PARTIAL: draft in `docs/RUNBOOK.md` grounded in the real APIs; deploy, key delivery, notification, and DR steps are marked GAP until built
 - [ ] Compliance mapping notes: GDPR, PCI-DSS, HIPAA, SOC 2
 - [ ] Security review of assembler and token crates
-- [ ] Final dependency license audit (`cargo deny check`) and attribution notices
-- [ ] Versioning/changelog (`CHANGELOG.md`)
+- [ ] Final dependency license audit (`cargo deny check`) and attribution notices — PARTIAL: `cargo deny check` passes on the current tree; attribution (NOTICE) for third-party crates not yet generated
+- [x] Versioning/changelog (`CHANGELOG.md`)
 - [ ] Release checklist and tagged `v1.0.0`

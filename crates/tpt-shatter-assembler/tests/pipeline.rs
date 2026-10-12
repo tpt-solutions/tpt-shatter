@@ -13,7 +13,8 @@ use tpt_shatter_common::{Record, SHARD_KEY_LEN, ShardKey, ShatterError, ShatterS
 use tpt_shatter_emitter::{Emitter, MemorySink, Policy, Transform};
 use tpt_shatter_shredder::{Shredder, erase};
 use tpt_shatter_vault_client::{
-    BreakerConfig, Guarded, MemoryVault, Router, decode_fields, derive_fragment_id, system_clock,
+    BreakerConfig, Guarded, MemoryVault, Router, decode_fields, derive_fragment_id,
+    split_schema_version, system_clock,
 };
 
 const DERIVATION_KEY: [u8; 32] = [0xA1; 32];
@@ -118,7 +119,9 @@ fn full_pipeline_round_trip_places_fragments_correctly() {
         assert_eq!(s.vaults[index].row_count(), Ok(1), "{vault}");
         let id = derive_fragment_id(&DERIVATION_KEY, &key, vault).expect("id");
         let body = s.router.get(vault, &id).expect("get").expect("present");
-        for (name, _) in decode_fields(&body).expect("decode") {
+        let (version, fields) = split_schema_version(&body).expect("version header");
+        assert_eq!(version, s.schema.version());
+        for (name, _) in decode_fields(fields).expect("decode") {
             assert_eq!(s.schema.vault_for(&name), Some(vault), "{name} in {vault}");
         }
     }

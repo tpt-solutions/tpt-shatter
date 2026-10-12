@@ -19,7 +19,7 @@ mod guard;
 mod router;
 
 pub use backend::{MemoryVault, VaultBackend};
-pub use codec::{decode_fields, encode_fields};
+pub use codec::{add_schema_version, decode_fields, encode_fields, split_schema_version};
 pub use derive::{derive_fragment_id, keyed_digest};
 pub use guard::{BreakerConfig, BreakerState, Clock, Guarded, VaultStatus, system_clock};
 pub use router::Router;

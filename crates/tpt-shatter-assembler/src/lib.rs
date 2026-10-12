@@ -15,7 +15,7 @@
 use std::thread;
 
 use tpt_shatter_common::{Record, ShardKey, ShatterError, ShatterSchema, VaultId};
-use tpt_shatter_vault_client::{Router, decode_fields, derive_fragment_id};
+use tpt_shatter_vault_client::{Router, decode_fields, derive_fragment_id, split_schema_version};
 use zeroize::Zeroizing;
 
 /// One fragment body, zeroed on drop because it holds field values.
@@ -52,7 +52,13 @@ impl<'a> Assembler<'a> {
         let bodies = self.fetch(shard)?;
         let mut record = Record::new();
         for (vault, body) in &bodies {
-            for (name, value) in decode_fields(body)? {
+            // A fragment written under another schema version cannot be read safely,
+            // so it is refused the same way as a malformed one.
+            let (version, fields) = split_schema_version(body)?;
+            if version != self.schema.version() {
+                return Err(ShatterError::Reconstruction);
+            }
+            for (name, value) in decode_fields(fields)? {
                 if self.schema.vault_for(&name) != Some(*vault) {
                     return Err(ShatterError::Reconstruction);
                 }
@@ -221,6 +227,30 @@ mod tests {
         let wrong = [0x11; 32];
         assert_eq!(
             Assembler::new(&f.schema, &f.router, wrong)
+                .assemble(&shard())
+                .err(),
+            Some(ShatterError::Reconstruction)
+        );
+    }
+
+    #[test]
+    fn fragment_from_another_schema_version_is_rejected() {
+        use tpt_shatter_vault_client::add_schema_version;
+        let f = fixture();
+        shred(&f);
+        // Re-store vault A's fields under schema version 2. The version check must refuse it.
+        let body = f
+            .router
+            .get(VaultId::A, &fragment_id(VaultId::A))
+            .expect("get")
+            .expect("present");
+        let (_, fields) = split_schema_version(&body).expect("split");
+        let rewritten = add_schema_version(2, fields);
+        f.router
+            .put(VaultId::A, &fragment_id(VaultId::A), &rewritten)
+            .expect("put");
+        assert_eq!(
+            Assembler::new(&f.schema, &f.router, KEY)
                 .assemble(&shard())
                 .err(),
             Some(ShatterError::Reconstruction)

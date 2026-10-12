@@ -1,6 +1,6 @@
 # Contributing to tpt-shatter
 
-Thanks for helping. Please read [spec.txt](spec.txt) first; it is the source of truth for the architecture.
+Thanks for helping. Please read [DESIGN.md](DESIGN.md) first; it is the source of truth for the architecture.
 
 ## Licensing of contributions
 

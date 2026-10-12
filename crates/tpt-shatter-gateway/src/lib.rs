@@ -5,16 +5,20 @@
 //! on canary alarms, readiness, and access logs.
 //!
 //! [`Gateway::read`] is transport-neutral. It takes a token and a shard in hex and
-//! returns a [`Response`]. The HTTP server is not in this crate yet. The axum and
-//! tonic dependencies need a license-policy decision first (see the checklist).
+//! returns a [`Response`]. [`serve`] wraps it in an HTTP/1.1 server (hyper, MIT). The
+//! gRPC transport was dropped; see `DECISIONS.md`.
 //!
 //! The gateway does not depend on the vault client. It reaches records only through
 //! the [`RecordSource`] trait, which the assembler will implement.
 
+mod http;
 mod ratelimit;
 mod service;
+mod tls;
 
+pub use http::{AccessLog, BreakerProbe, HttpConfig, Shared, serve, serve_tls};
 pub use ratelimit::RateLimiter;
 pub use service::{
     AlarmResponder, Gateway, RecordSource, Response, SigningKeyRotator, public_error, ready,
 };
+pub use tls::{acceptor, server_config};

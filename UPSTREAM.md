@@ -38,3 +38,35 @@ time of checking. Re-verify and replace them with tags before any release.
   `deny.toml`. The emitter will write to tpt-strata's native format only. `deny.toml` bans
   `parquet` and `arrow`, so CI fails if either is added. Reinstating the bridge would require
   an explicit, documented policy exception and removing those bans.
+
+## Verification pass (checked against `master` via GitHub raw files)
+
+### tpt-keystone-db audit log (canary tail question)
+- The audit log is the Mirror layer, source `tpt-keystone/src/mirror/audit.rs`.
+- Storage: rows in the table `_mirror_audit` inside keystone's own database.
+- Public Rust API: `AuditLog::record`, `AuditLog::verify_chain(session_id)`,
+  `AuditLog::generate_report(session_id)`. The read path `entries_for` is private.
+- **External access: none found.** No SQL function, wire command, HTTP endpoint, or file
+  path exposes the log. A canary can read it only by querying `_mirror_audit` over the
+  wire protocol, which is polling, not a stream.
+- **Not tamper-evident to outsiders.** Hashes are stored in the same table as the
+  entries, so a principal with write access could rewrite the rows and recompute the
+  chain. Our `AuditChain` (keyed, separate key) must hold the anchor, so the canary
+  should record the chain head outside keystone.
+- **Query logging: not verified.** The Mirror docs and `audit.rs` don't say whether
+  query text goes into `details`. Until that is checked in `mirror/` or the write path,
+  the canary cannot rely on it to see canary FragmentIds in queries.
+- Checklist status: partially answered. Polling `_mirror_audit` is possible.
+  Whether it captures query text is still open.
+
+### tpt-strata API and durability
+- Embedding types: `Table` and `Column` (`format.rs`) build tables from Rust data;
+  `QueryBuilder` (`query.rs`) is a consuming builder. The group-by and sum method names
+  aren't in the docs.
+- **Durability: not documented.** `spec.txt` and `ARCHITECTURE.md` describe an
+  in-memory, native columnar engine with pull-based operators that fully materialize
+  their output. They say nothing about persistence, write path, flush, or recovery.
+  Parquet is import-only.
+- Consequence: strata cannot be the durable copy of anonymized events. See the
+  `JsonlSink` decision in `DECISIONS.md`.
+- Checklist status: API partly known, durability open with the upstream owner.

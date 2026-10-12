@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 
 const SHARD_DOMAIN: &[u8] = b"tpt-shatter/canary/shard/v1";
 const PREFIX_DOMAIN: &[u8] = b"tpt-shatter/canary/prefix/v1";
+const EPOCH_DOMAIN: &[u8] = b"tpt-shatter/canary/epoch/v1";
 
 /// Describes the canaries to inject: count, shard keys, and value prefix.
 ///
@@ -49,6 +50,19 @@ impl CanaryPlan {
             derivation_key: Zeroizing::new(derivation_key),
             count,
         })
+    }
+
+    /// Builds the plan for one rotation epoch. The canary key is derived from
+    /// `master_key` and `epoch`, so each epoch yields fresh canaries while the
+    /// master key stays fixed. Canaries from an old epoch stop matching.
+    pub fn for_epoch(
+        master_key: [u8; 32],
+        derivation_key: [u8; 32],
+        count: usize,
+        epoch: u64,
+    ) -> Result<Self, ShatterError> {
+        let canary_key = keyed_digest(&master_key[..], EPOCH_DOMAIN, &epoch.to_be_bytes())?;
+        Self::new(canary_key, derivation_key, count)
     }
 
     /// Number of canaries in the plan.
@@ -90,6 +104,16 @@ impl CanaryPlan {
         }
         Ok(record)
     }
+}
+
+/// The rotation epoch containing `now`, for epochs of `period_secs` seconds.
+///
+/// Pass the result to [`CanaryPlan::for_epoch`]. A zero period is rejected.
+pub const fn epoch_at(now: u64, period_secs: u64) -> Result<u64, ShatterError> {
+    if period_secs == 0 {
+        return Err(ShatterError::InvalidParameter);
+    }
+    Ok(now / period_secs)
 }
 
 /// One canary found in a query.
@@ -308,6 +332,31 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn epochs_rotate_canaries_deterministically() {
+        let a = CanaryPlan::for_epoch(CANARY_KEY, DERIVATION_KEY, 2, 7).expect("plan");
+        let a_again = CanaryPlan::for_epoch(CANARY_KEY, DERIVATION_KEY, 2, 7).expect("plan");
+        let b = CanaryPlan::for_epoch(CANARY_KEY, DERIVATION_KEY, 2, 8).expect("plan");
+        assert_eq!(a.prefix().expect("p"), a_again.prefix().expect("p"));
+        assert_eq!(
+            a.shard(0).expect("s").as_bytes(),
+            a_again.shard(0).expect("s").as_bytes()
+        );
+        assert_ne!(a.prefix().expect("p"), b.prefix().expect("p"));
+        assert_ne!(
+            a.shard(0).expect("s").as_bytes(),
+            b.shard(0).expect("s").as_bytes()
+        );
+    }
+
+    #[test]
+    fn epoch_at_buckets_time_and_rejects_zero_period() {
+        assert_eq!(epoch_at(0, 3600), Ok(0));
+        assert_eq!(epoch_at(3599, 3600), Ok(0));
+        assert_eq!(epoch_at(3600, 3600), Ok(1));
+        assert_eq!(epoch_at(10, 0), Err(ShatterError::InvalidParameter));
     }
 
     #[test]

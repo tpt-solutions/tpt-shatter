@@ -67,9 +67,51 @@ fn take_chunk(input: &[u8]) -> Result<(&[u8], &[u8]), ShatterError> {
     Ok(rest.split_at(len))
 }
 
+/// Length of the schema-version header that prefixes every stored fragment body.
+pub const VERSION_HEADER_LEN: usize = 4;
+
+/// Prefixes a fragment body with the schema version it was written under.
+///
+/// Storing the version with each fragment lets the assembler refuse a body written
+/// under a different schema, instead of misreading it.
+#[must_use]
+pub fn add_schema_version(version: u32, body: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(VERSION_HEADER_LEN + body.len()));
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Splits a stored fragment into its schema version and the field bytes.
+///
+/// A body shorter than the header yields [`ShatterError::Reconstruction`].
+pub fn split_schema_version(bytes: &[u8]) -> Result<(u32, &[u8]), ShatterError> {
+    let (header, rest) = bytes
+        .split_first_chunk::<VERSION_HEADER_LEN>()
+        .ok_or(ShatterError::Reconstruction)?;
+    Ok((u32::from_be_bytes(*header), rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_version_round_trips_ahead_of_the_fields() {
+        let fields = encode_fields([("name", "A. Example")]).expect("encode");
+        let stored = add_schema_version(7, &fields);
+        let (version, rest) = split_schema_version(&stored).expect("split");
+        assert_eq!(version, 7);
+        assert_eq!(decode_fields(rest).expect("decode")[0].0, "name");
+    }
+
+    #[test]
+    fn short_body_has_no_version_header() {
+        assert_eq!(
+            split_schema_version(&[0, 1, 2]).err(),
+            Some(ShatterError::Reconstruction)
+        );
+    }
 
     #[test]
     fn round_trips_fields() {

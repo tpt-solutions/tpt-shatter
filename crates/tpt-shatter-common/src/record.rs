@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 /// A reconstructed record, held in RAM only.
 ///
@@ -56,6 +56,9 @@ impl Record {
     }
 }
 
+// Every value is a `Zeroizing<String>`, so dropping the record zeroes all values.
+impl ZeroizeOnDrop for Record {}
+
 impl fmt::Debug for Record {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Record")
@@ -85,6 +88,12 @@ mod tests {
         let shown = format!("{r:?}");
         assert!(shown.contains("ssn"));
         assert!(!shown.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn record_is_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Record>();
     }
 
     #[test]

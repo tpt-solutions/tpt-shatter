@@ -304,12 +304,12 @@ Layer
 Technology
 Language
 Rust
-Web Framework
-axum (gateway), tonic (internal gRPC)
+HTTP and TLS
+hyper 1 over HTTP/1.1 (gateway); rustls 0.23 with rustls-graviola 0.2.1, TLS 1.3, optional mTLS. axum and tonic dropped; see DECISIONS.md
 Fragment Storage
 tpt-keystone-db (isolated instances per fragment type)
 Analytics Sink
-tpt-strata + tpt-strata-parquet (embedded, zero-dependency)
+tpt-strata (embedded, in-memory engine). Durable copy is an append-only JSON-lines log; strata is rebuilt from it. Parquet bridge dropped.
 Memory Zeroing
 zeroize crate
 Serialization
@@ -319,9 +319,25 @@ Terraform + Kubernetes
 Container Images
 Distroless (Google)
 Observability
-OpenTelemetry + Grafana
+tracing with structured JSON logs (planned); OTLP export deferred; Grafana
 Policy Engine
 OPA (Open Policy Agent)
+12a. Decisions Since the Draft
+The gaps in section 10 and the Phase 0 items are resolved in
+[DECISIONS.md](DECISIONS.md). Upstream findings are in [UPSTREAM.md](UPSTREAM.md).
+Summary of threat-model addenda (section 7):
+- Audit log: keyed HMAC chain in the gateway and shredder. Keystone's own `_mirror_audit`
+  is not tamper-evident to outsiders, so its head hash is anchored outside keystone.
+- Analytics: the durable copy of anonymized events is an append-only log, so an analytics
+  store failure cannot lose data.
+- Orphan fragments: failed compensating deletes are retried by `reap` and then abandoned
+  and counted. The queue is backed by an append-only file (`Shredder::with_orphan_log`), so
+  a restart keeps the orphans. Attempt counts reset on restart.
+- Schema version: every fragment carries the version it was written under, and the
+  assembler refuses a mismatch rather than misreading the fields.
+- Transport: TLS 1.3 only, with mTLS available. Certificates for services are not yet
+  provisioned automatically.
+
 13. Versioning & Changelog
 Version
 Date

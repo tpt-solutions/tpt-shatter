@@ -2,6 +2,7 @@
 // Copyright (c) 2026 TPT Solutions
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -41,6 +42,20 @@ impl TryFrom<RawSchema> for ShatterSchema {
 }
 
 impl ShatterSchema {
+    /// Parses a schema from its JSON form, e.g. `{"version": 1, "fields": {"name": "A"}}`.
+    ///
+    /// Parse failures map to [`ShatterError::InvalidSchema`] without echoing the
+    /// input, so a malformed file cannot leak field data through an error.
+    pub fn from_json_str(json: &str) -> Result<Self, ShatterError> {
+        serde_json::from_str(json).map_err(|_| ShatterError::InvalidSchema)
+    }
+
+    /// Loads and validates a schema from a JSON file on disk.
+    pub fn load_json_file(path: &Path) -> Result<Self, ShatterError> {
+        let json = std::fs::read_to_string(path).map_err(|_| ShatterError::InvalidSchema)?;
+        Self::from_json_str(&json)
+    }
+
     /// Builds a schema. Rejects version 0, an empty schema, malformed field
     /// names, and duplicate field names.
     pub fn new<I, S>(version: u32, fields: I) -> Result<Self, ShatterError>
@@ -140,6 +155,28 @@ mod tests {
         let s = ShatterSchema::try_from(RawSchema { version: 2, fields }).expect("valid");
         assert_eq!(s.version(), 2);
         assert_eq!(s.vault_for("name"), Some(VaultId::A));
+    }
+
+    #[test]
+    fn loads_from_json() {
+        let json = r#"{"version": 3, "fields": {"name": "A", "card_number": "C"}}"#;
+        let s = ShatterSchema::from_json_str(json).expect("valid");
+        assert_eq!(s.version(), 3);
+        assert_eq!(s.vault_for("card_number"), Some(VaultId::C));
+    }
+
+    #[test]
+    fn json_errors_are_fixed_and_do_not_echo_input() {
+        // Unknown vault labels surface through serde, so they collapse to InvalidSchema.
+        let err = ShatterSchema::from_json_str(r#"{"version": 1, "fields": {"ssn": "Q"}}"#);
+        assert_eq!(err.err(), Some(ShatterError::InvalidSchema));
+        let err = ShatterSchema::from_json_str(r#"{"version": "x123-secret"#);
+        assert_eq!(err.err(), Some(ShatterError::InvalidSchema));
+        let missing = Path::new("definitely-missing-schema.json");
+        assert_eq!(
+            ShatterSchema::load_json_file(missing).err(),
+            Some(ShatterError::InvalidSchema)
+        );
     }
 
     #[test]

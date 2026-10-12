@@ -18,6 +18,6 @@ We aim to acknowledge reports within 3 business days.
 ## Scope
 
 In scope: all crates in this workspace, the infrastructure and policy code, and the CI pipeline.
-Out of scope: side-channel attacks requiring hardware access (see spec.txt §7.2).
+Out of scope: side-channel attacks requiring hardware access (see DESIGN.md §7.2).
 
 Never include real personal data, real credentials, or live canary values in a report.

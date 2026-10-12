@@ -8,10 +8,11 @@
 //! and compensates partial failures. [`erase`] removes every fragment for a shard
 //! (GDPR erasure).
 //!
-//! Not implemented yet: the internal gRPC ingestion service with mTLS, the orphan
-//! fragment reaper, RAM-only key loading, and schema-file loading.
+//! Not implemented yet: the internal ingestion service with mTLS, RAM-only key loading,
+//! and durable storage for the orphan queue (it is in RAM only).
 
 mod erase;
+mod orphans;
 mod shred;
 
 pub use erase::{EraseReport, erase};

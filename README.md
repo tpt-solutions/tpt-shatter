@@ -4,9 +4,10 @@
 through **data fragmentation**, **ephemeral in-memory processing**, **strict network isolation**,
 **capability-based access control**, **canary (honeytoken) detection**, and **anonymized analytics**.
 
-> **Status:** design phase. The workspace is scaffolded; no crate is implemented yet.
+> **Status:** early implementation. `tpt-shatter-common`, `-anonymize`, and `-token` are implemented and tested;
+> the remaining crates are scaffolds. See the checklist for what is done and what is pending.
 
-- Architecture and rationale: [spec.txt](spec.txt)
+- Architecture and rationale: [DESIGN.md](DESIGN.md)
 - Implementation checklist: [todo.md](todo.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Security reporting: [SECURITY.md](SECURITY.md)

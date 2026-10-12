@@ -12,6 +12,9 @@
 //! ingest API has not been verified (see UPSTREAM.md).
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::sync::Mutex;
 
 use tpt_shatter_anonymize::{add_noise, bucket, check_k_anonymity, mask, pseudonymize};
@@ -388,5 +391,119 @@ mod tests {
         assert!(Policy::new(b"s".to_vec(), dropped, vec!["zip".to_owned()], 1).is_err());
         let bad_width = [("y".to_owned(), Transform::Bucket { width: 0 })];
         assert!(Policy::new(b"s".to_vec(), bad_width, vec![], 1).is_err());
+    }
+}
+
+/// Durable, append-only sink: one JSON object per line, one line per event.
+///
+/// The analytics store is rebuilt from this file, so the file is the durable copy.
+/// Each batch is flushed with `sync_data` before `emit` returns, so a successful
+/// return means the batch is on disk. Only fields the policy allowed through are written.
+pub struct JsonlSink {
+    file: Mutex<File>,
+}
+
+impl JsonlSink {
+    /// Opens (or creates) the log for appending.
+    pub fn open(path: &Path) -> Result<Self, ShatterError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|_| ShatterError::Internal)?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    /// Reads every event back, in write order. Any malformed line fails the whole read.
+    pub fn read_all(path: &Path) -> Result<Vec<Event>, ShatterError> {
+        let file = File::open(path).map_err(|_| ShatterError::Internal)?;
+        BufReader::new(file)
+            .lines()
+            .map(|line| {
+                let line = line.map_err(|_| ShatterError::Internal)?;
+                let map: BTreeMap<String, String> =
+                    serde_json::from_str(&line).map_err(|_| ShatterError::Internal)?;
+                Ok(Event { fields: map })
+            })
+            .collect()
+    }
+}
+
+impl EventSink for JsonlSink {
+    fn emit(&self, batch: &[Event]) -> Result<(), ShatterError> {
+        let mut out = Vec::new();
+        for event in batch {
+            serde_json::to_writer(&mut out, &event.fields).map_err(|_| ShatterError::Internal)?;
+            out.push(b'\n');
+        }
+        let mut file = self.file.lock().map_err(|_| ShatterError::Internal)?;
+        file.write_all(&out).map_err(|_| ShatterError::Internal)?;
+        file.sync_data().map_err(|_| ShatterError::Internal)
+    }
+}
+
+#[cfg(test)]
+mod jsonl_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("tpt-shatter-{name}-{nanos}.jsonl"))
+    }
+
+    fn event(pairs: &[(&str, &str)]) -> Event {
+        Event {
+            fields: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn events_round_trip_through_the_file_in_order() {
+        let path = temp_path("roundtrip");
+        let sink = JsonlSink::open(&path).expect("open");
+        sink.emit(&[event(&[("age_band", "30-39")])]).expect("emit");
+        sink.emit(&[
+            event(&[("age_band", "40-49"), ("note", "quote \" and \\ slash")]),
+            event(&[("age_band", "50-59")]),
+        ])
+        .expect("emit");
+        let back = JsonlSink::read_all(&path).expect("read");
+        std::fs::remove_file(&path).expect("cleanup");
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].get("age_band"), Some("30-39"));
+        assert_eq!(back[1].get("note"), Some("quote \" and \\ slash"));
+        assert_eq!(back[2].get("age_band"), Some("50-59"));
+    }
+
+    #[test]
+    fn reopening_appends_rather_than_truncates() {
+        let path = temp_path("append");
+        JsonlSink::open(&path)
+            .expect("open")
+            .emit(&[event(&[("a", "1")])])
+            .expect("emit");
+        JsonlSink::open(&path)
+            .expect("reopen")
+            .emit(&[event(&[("a", "2")])])
+            .expect("emit");
+        let back = JsonlSink::read_all(&path).expect("read");
+        std::fs::remove_file(&path).expect("cleanup");
+        assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn malformed_line_fails_the_read() {
+        let path = temp_path("malformed");
+        std::fs::write(&path, "{\"a\":\"1\"}\nnot json\n").expect("write");
+        let result = JsonlSink::read_all(&path);
+        std::fs::remove_file(&path).expect("cleanup");
+        assert_eq!(result.err(), Some(ShatterError::Internal));
     }
 }
