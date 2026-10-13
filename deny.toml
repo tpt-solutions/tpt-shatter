@@ -33,3 +33,6 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# tpt-strata is pinned by commit in crates/tpt-shatter-emitter/Cargo.toml. It has zero
+# dependencies and is MIT OR Apache-2.0 (see UPSTREAM.md). No other git source is allowed.
+allow-git = ["https://github.com/tpt-solutions/tpt-strata"]

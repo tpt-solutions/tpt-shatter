@@ -39,6 +39,8 @@ pub enum AuditAction {
     Alarm,
     /// The token signing key was rotated.
     KeyRotation,
+    /// A capability token was issued.
+    Issue,
 }
 
 impl AuditAction {
@@ -49,7 +51,20 @@ impl AuditAction {
             Self::Erasure => 3,
             Self::Alarm => 4,
             Self::KeyRotation => 5,
+            Self::Issue => 6,
         }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Ingest,
+            2 => Self::Read,
+            3 => Self::Erasure,
+            4 => Self::Alarm,
+            5 => Self::KeyRotation,
+            6 => Self::Issue,
+            _ => return None,
+        })
     }
 }
 
@@ -87,6 +102,58 @@ impl AuditRecord {
     #[must_use]
     pub const fn event(&self) -> &AuditEvent {
         &self.event
+    }
+
+    /// One JSON line for the on-disk log. Digests and the MAC are hex. Nothing else is
+    /// stored, so a line holds no payload.
+    #[must_use]
+    pub fn encode_line(&self) -> String {
+        let vault = self.event.vault.map(|v| v.label().to_string());
+        serde_json::json!({
+            "seq": self.seq,
+            "action": self.event.action.code(),
+            "token": hex_encode(&self.event.token_digest),
+            "shard": hex_encode(&self.event.shard_digest),
+            "vault": vault,
+            "at": self.event.at,
+            "mac": hex_encode(&self.mac),
+        })
+        .to_string()
+    }
+
+    /// Parses one line written by [`AuditRecord::encode_line`].
+    ///
+    /// The result is not trusted. Pass the decoded records to [`verify_chain`] before
+    /// relying on them.
+    pub fn decode_line(line: &str) -> Result<Self, ShatterError> {
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|_| ShatterError::Internal)?;
+        let seq = value["seq"].as_u64().ok_or(ShatterError::Internal)?;
+        let action = value["action"]
+            .as_u64()
+            .and_then(|c| u8::try_from(c).ok())
+            .and_then(AuditAction::from_code)
+            .ok_or(ShatterError::Internal)?;
+        let vault = match &value["vault"] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => {
+                let label = s.chars().next().ok_or(ShatterError::Internal)?;
+                Some(VaultId::from_label(label)?)
+            }
+            _ => return Err(ShatterError::Internal),
+        };
+        let event = AuditEvent {
+            action,
+            token_digest: hex_decode(value["token"].as_str())?,
+            shard_digest: hex_decode(value["shard"].as_str())?,
+            vault,
+            at: value["at"].as_u64().ok_or(ShatterError::Internal)?,
+        };
+        Ok(Self {
+            seq,
+            event,
+            mac: hex_decode(value["mac"].as_str())?,
+        })
     }
 
     /// The chain MAC for this record.
@@ -177,6 +244,90 @@ fn absorb(mac: &mut HmacSha256, seq: u64, prev: &[u8; AUDIT_DIGEST_LEN], event: 
     mac.update(&event.shard_digest);
     mac.update(&[event.vault.map_or(0, |v| v.label() as u8)]);
     mac.update(&event.at.to_be_bytes());
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn hex_decode(text: Option<&str>) -> Result<[u8; AUDIT_DIGEST_LEN], ShatterError> {
+    let text = text.ok_or(ShatterError::Internal)?;
+    if text.len() != AUDIT_DIGEST_LEN * 2 || !text.is_ascii() {
+        return Err(ShatterError::Internal);
+    }
+    let mut out = [0u8; AUDIT_DIGEST_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte =
+            u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|_| ShatterError::Internal)?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [0x3C; 32];
+
+    fn event(action: AuditAction, vault: Option<VaultId>, at: u64) -> AuditEvent {
+        AuditEvent {
+            action,
+            token_digest: [0xAA; AUDIT_DIGEST_LEN],
+            shard_digest: [0xBB; AUDIT_DIGEST_LEN],
+            vault,
+            at,
+        }
+    }
+
+    #[test]
+    fn lines_round_trip_and_still_verify() {
+        let mut chain = AuditChain::new(KEY);
+        let records = vec![
+            chain
+                .append(event(AuditAction::Issue, None, 1))
+                .expect("append"),
+            chain
+                .append(event(AuditAction::Alarm, Some(VaultId::C), 2))
+                .expect("append"),
+        ];
+        let decoded: Vec<AuditRecord> = records
+            .iter()
+            .map(|r| AuditRecord::decode_line(&r.encode_line()).expect("decode"))
+            .collect();
+        assert_eq!(decoded, records);
+        assert_eq!(verify_chain(KEY, &decoded), Ok(()));
+    }
+
+    #[test]
+    fn a_tampered_line_decodes_but_fails_verification() {
+        let mut chain = AuditChain::new(KEY);
+        let records = [chain
+            .append(event(AuditAction::Issue, None, 5))
+            .expect("append")];
+        let edited = records[0].encode_line().replace("\"at\":5", "\"at\":6");
+        let decoded = AuditRecord::decode_line(&edited).expect("decode");
+        assert!(verify_chain(KEY, &[decoded]).is_err());
+    }
+
+    #[test]
+    fn malformed_lines_are_refused() {
+        assert_eq!(
+            AuditRecord::decode_line("not json").err(),
+            Some(ShatterError::Internal)
+        );
+        assert_eq!(
+            AuditRecord::decode_line(
+                r#"{"seq":0,"action":99,"token":"","shard":"","vault":null,"at":1,"mac":""}"#
+            )
+            .err(),
+            Some(ShatterError::Internal)
+        );
+    }
 }
 
 #[cfg(test)]

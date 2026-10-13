@@ -45,6 +45,8 @@ async fn start(client_ca: Option<&[u8]>) -> std::net::SocketAddr {
         breakers: Arc::new(|| vec![false]),
         access_log: Arc::new(|_: &str| {}),
         config: HttpConfig::default(),
+        source_limiter: None,
+        writer: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

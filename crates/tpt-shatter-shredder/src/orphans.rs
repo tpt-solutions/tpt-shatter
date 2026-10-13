@@ -12,6 +12,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde_json::{Value, json};
 use tpt_shatter_common::{FRAGMENT_ID_LEN, FragmentId, ShatterError, VaultId};
@@ -22,6 +23,40 @@ pub(crate) struct Orphan {
     pub(crate) vault: VaultId,
     pub(crate) id: FragmentId,
     pub(crate) attempts: u32,
+}
+
+/// The orphan queue, shared by every shredder that uses it.
+///
+/// Shredders built with [`crate::Shredder::with_store`] over the same store see one queue,
+/// so no two of them can overwrite each other's orphans in the log.
+pub struct OrphanStore {
+    pub(crate) queue: Mutex<Vec<Orphan>>,
+    pub(crate) log: Option<OrphanLog>,
+}
+
+impl OrphanStore {
+    /// A queue kept in RAM only.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            queue: Mutex::new(Vec::new()),
+            log: None,
+        }
+    }
+
+    /// A queue backed by the file at `path`, loading any orphans it holds.
+    pub fn open(path: &Path) -> Result<Self, ShatterError> {
+        let (log, loaded) = OrphanLog::open(path)?;
+        Ok(Self {
+            queue: Mutex::new(loaded),
+            log: Some(log),
+        })
+    }
+
+    /// Number of orphans waiting for a reap.
+    pub fn pending(&self) -> Result<usize, ShatterError> {
+        Ok(self.queue.lock().map_err(|_| ShatterError::Internal)?.len())
+    }
 }
 
 /// Append-only file backing the orphan queue.

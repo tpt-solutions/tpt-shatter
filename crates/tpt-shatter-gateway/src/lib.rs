@@ -12,11 +12,13 @@
 //! the [`RecordSource`] trait, which the assembler will implement.
 
 mod http;
+mod ingest;
 mod ratelimit;
 mod service;
 mod tls;
 
-pub use http::{AccessLog, BreakerProbe, HttpConfig, Shared, serve, serve_tls};
+pub use http::{AccessLog, BreakerProbe, HttpConfig, Shared, WriteHandler, serve, serve_tls};
+pub use ingest::{RecordSink, Writer};
 pub use ratelimit::RateLimiter;
 pub use service::{
     AlarmResponder, Gateway, RecordSource, Response, SigningKeyRotator, public_error, ready,

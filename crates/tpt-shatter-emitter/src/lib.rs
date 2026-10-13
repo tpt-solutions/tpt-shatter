@@ -11,6 +11,10 @@
 //! The sink is a trait. The real tpt-strata adapter is not written yet, because its
 //! ingest API has not been verified (see UPSTREAM.md).
 
+mod strata;
+
+pub use strata::StrataSink;
+
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -148,6 +152,17 @@ pub struct Event {
 }
 
 impl Event {
+    /// Builds an event from `(name, value)` pairs. Used by tests in this crate.
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            fields: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
     /// The anonymized value of `name`, if it was emitted.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {

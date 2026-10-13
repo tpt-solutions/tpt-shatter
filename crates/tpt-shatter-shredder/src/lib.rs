@@ -8,12 +8,16 @@
 //! and compensates partial failures. [`erase`] removes every fragment for a shard
 //! (GDPR erasure).
 //!
-//! Not implemented yet: the internal ingestion service with mTLS, RAM-only key loading,
-//! and durable storage for the orphan queue (it is in RAM only).
+//! Not implemented yet: the internal ingestion service with mTLS and RAM-only key loading.
+//! The orphan queue is durable when built with [`Shredder::with_orphan_log`]. Background
+//! reaping is [`run_reaper`].
 
 mod erase;
 mod orphans;
+mod reaper;
 mod shred;
 
 pub use erase::{EraseReport, erase};
-pub use shred::{ShredReport, Shredder};
+pub use orphans::OrphanStore;
+pub use reaper::run_reaper;
+pub use shred::{ReapReport, ShredReport, Shredder};

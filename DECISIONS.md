@@ -44,7 +44,7 @@ that is said. Changing a decision means editing this file and the checklist toge
     Tested with real handshakes in `crates/tpt-shatter-gateway/tests/tls.rs`, using
     test-only certificates in `tests/fixtures/` (see the README there).
   - Still open: certificate issuance and rotation for services, the 1.85 MSRV check
-    for graviola 0.2.1, and the TLS/SCRAM setup for the keystone vault connections.
+    for graviola 0.2.1, and the TLS/SCRAM setup for the keystone vault connections (superseded: keystone was dropped, see "Vault storage").
 
 ## Data model
 
@@ -140,6 +140,104 @@ that is said. Changing a decision means editing this file and the checklist toge
 
 ## Audit anchoring (added after the upstream check)
 
-- Keystone's `_mirror_audit` chain sits in the same table as the entries, so it isn't
+- (Superseded: keystone was dropped, see "Vault storage".) Keystone's `_mirror_audit` chain sits in the same table as the entries, so it isn't
   tamper-evident to an outsider. Our `AuditChain` head hash is written outside keystone
   at each canary poll. A rewrite of `_mirror_audit` then fails against the anchor.
+
+## Vault storage (supersedes keystone)
+
+- **Decision: replace tpt-keystone-db with an internal vault store, `FileVault`**
+  (`crates/tpt-shatter-vault-client/src/file_vault.rs`). Each vault is its own directory
+  with its own sealing key, and each fragment is one encrypted file.
+- **Why keystone was dropped.** Verified in the source (see `UPSTREAM.md`):
+  - Every insert, update, and delete publishes the full before and after row, in
+    plaintext, to a `__cdc_<table>` topic with unlimited retention. There is no per-table
+    opt-out and no way to purge a deleted row's history. That defeats GDPR erasure for
+    fragments.
+  - The audit log (`_mirror_audit`) and the tracer are not called from the server's
+    production path. They are used only by tests.
+  - Query text is not logged, so canary query detection could not rely on keystone.
+  - We only need lookup, write, and delete by FragmentId. A keyed file store does that
+    directly, so keystone's SQL engine adds nothing here.
+- **What FileVault provides:**
+  - Encryption at rest with ChaCha20-Poly1305. The vault label and FragmentId are bound
+    as associated data, so a file moved between vaults or IDs fails to open.
+  - Atomic writes: temporary file, sync, rename. Leftover temporary files are removed
+    when the vault opens.
+  - Erasure: overwrite with zeros, sync, remove. Nothing keeps a change history.
+  - Isolation: separate directory and key per vault. Key delivery is still a gap.
+- **What we now own, and do not have yet:**
+  - Replication and high availability. A vault is one directory on one volume.
+  - Backups and restore. These are needed before production (see RUNBOOK).
+  - Overwrite-based erasure is not guaranteed on SSDs with wear leveling or on
+    copy-on-write file systems. Encryption is what protects erased data in that case, so
+    key destruction must be part of erasure for those volumes. **Not built.**
+  - Concurrency and performance at scale. The store is intended for the current volume.
+- **Consequences for other decisions:**
+  - Vault TLS and SCRAM are no longer needed for vault connections, because vaults are
+    local files. Vault traffic is in-process.
+  - Canary query-log tailing is replaced by in-band detection in the vault client: the
+    router checks each FragmentId it reads or deletes against the canary detector.
+    In-band detection does not see direct access to a vault's files on the host.
+    That case needs host-level monitoring, which is not built.
+  - Keystone's audit anchoring is not needed. The keyed `AuditChain` remains the audit
+    trail.
+
+## Canary detection in the vault client (supersedes the query-log plan; access model revised below)
+
+- **Decision: detect canaries in the router, not in a database query log.** The router
+  reports every read to a `ReadObserver`. `CanaryWatch` (canary crate) checks each
+  FragmentId against the current epoch's canaries and queues an alarm on a hit. Nothing
+  in the system reads a canary on purpose, so any hit is suspicious.
+- **Only reads are observed.** Deletes and writes are not. Erasure and canary rotation
+  both delete, and a delete alone cannot be told apart from them. Erasure verifies by
+  presence, through `Router::contains`, which is not observed. Otherwise every rotation
+  would alarm on its own old canaries. This was found by a failing test and fixed.
+- **Trade-off:** `Router::contains` lets a caller learn whether a FragmentId exists
+  without raising an alarm. The method is inside the trust boundary, but it is still a
+  weakness. Restricting it to erasure is a follow-up.
+- **Not covered:** direct access to a vault's files on the host, and any caller that
+  bypasses the router. Host-level monitoring is needed for those and is not built.
+- **Not yet wired:** a loop that drains `CanaryWatch::take_alarms` into `AlarmGate`, and
+  into the alert log.
+
+## Canary access model (revised: supersedes the read-only observation above)
+
+- **Observed:** `Router::get` (reads) and `Router::delete` (deletes). Both reach the
+  `AccessObserver`, and `CanaryWatch` alarms on either one hitting a canary.
+- **Not observed:** `Router::put` (ingestion and canary injection write), and the
+  `*_maintenance` methods, used for erasure, canary rotation, saga compensation, and orphan
+  reaping. Maintenance is what used to force a choice between a false-alarm storm and an
+  existence oracle. Now it is a separate, explicit path.
+- **Why this is still an in-process boundary:** anyone who holds the `Router` can call the
+  maintenance methods, so this is a convention enforced by which code holds the router. The
+  external API (gateway and assembler) only reaches `get`, and deletes are not exposed
+  there. This is the accepted trust boundary for now.
+- **Closed:** the earlier `contains` presence oracle is gone. Erasure verifies through
+  `contains_maintenance`, which is only reachable from maintenance code.
+- **Response loop:** `CanaryMonitor::poll` drains the watch, runs the `AlarmGate`
+  response, then writes each alarm to the alert log. A failed response requeues the alarms
+  and keeps the gate armed, so nothing is lost on failure. Nothing calls `poll` on a timer
+  yet.
+
+## Token issuer (built)
+
+- **Contract (unchanged from above):** the host application authenticates the user upstream,
+  then calls `POST /v1/tokens` on the issuer listener with a shard and the scopes it needs.
+- **Caller authentication:** a bearer secret per caller. The config holds only the SHA-256
+  of each secret. Every caller is compared on every request with no early exit, so timing
+  does not reveal which caller matched. Chosen over per-caller certificates because the
+  node does not yet expose peer certificates to handlers. mTLS still applies when
+  `client_ca` is configured, since the listener shares the TLS acceptor.
+- **Policy:** each caller has an allowed scope list and a maximum TTL. `read` and `write`
+  are issuable. `delete` is never issuable, because erasure is a maintenance operation and
+  must not depend on a token. The default TTL is 60 seconds, the signer's maximum is 300,
+  and a caller's maximum is checked against both.
+- **Audit before release:** every issuance is appended to a keyed hash chain
+  (`state_dir/audit.jsonl`, sealed with `TPT_KEY_AUDIT`) and synced before the token is
+  returned. If the append fails, the token is withheld. After a failed write the store
+  refuses further records until restart, because the in-memory chain is then ahead of the
+  file. A restart verifies the whole chain before resuming it.
+- **Known gaps:** the audit event has no caller field, so the chain cannot say which caller
+  issued a token. The access log carries the caller name. Adding the field changes the
+  event format and needs a decision on how caller names are recorded.

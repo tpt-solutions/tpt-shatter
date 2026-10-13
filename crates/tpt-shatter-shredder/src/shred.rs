@@ -3,14 +3,14 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::thread;
 
 use tpt_shatter_common::{FragmentId, Record, ShardKey, ShatterError, ShatterSchema, VaultId};
 use tpt_shatter_vault_client::{Router, add_schema_version, derive_fragment_id, encode_fields};
 use zeroize::Zeroizing;
 
-use crate::orphans::{Orphan, OrphanLog};
+use crate::orphans::{Orphan, OrphanStore};
 
 /// Outcome of a successful [`Shredder::shred`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +45,7 @@ pub struct Shredder<'a> {
     schema: &'a ShatterSchema,
     router: &'a Router,
     derivation_key: Zeroizing<[u8; 32]>,
-    orphans: Mutex<Vec<Orphan>>,
-    orphan_log: Option<OrphanLog>,
+    store: Arc<OrphanStore>,
 }
 
 impl<'a> Shredder<'a> {
@@ -54,13 +53,12 @@ impl<'a> Shredder<'a> {
     /// `derivation_key` is held in RAM and zeroed on drop.
     #[must_use]
     pub fn new(schema: &'a ShatterSchema, router: &'a Router, derivation_key: [u8; 32]) -> Self {
-        Self {
+        Self::with_store(
             schema,
             router,
-            derivation_key: Zeroizing::new(derivation_key),
-            orphans: Mutex::new(Vec::new()),
-            orphan_log: None,
-        }
+            derivation_key,
+            Arc::new(OrphanStore::in_memory()),
+        )
     }
 
     /// Like [`Shredder::new`], but the orphan queue is backed by the file at `path`.
@@ -73,14 +71,25 @@ impl<'a> Shredder<'a> {
         derivation_key: [u8; 32],
         path: &Path,
     ) -> Result<Self, ShatterError> {
-        let (log, loaded) = OrphanLog::open(path)?;
-        Ok(Self {
+        let store = Arc::new(OrphanStore::open(path)?);
+        Ok(Self::with_store(schema, router, derivation_key, store))
+    }
+
+    /// A shredder over a shared orphan store. Several shredders built over one store see
+    /// one queue, so ingestion and the reaper can run side by side safely.
+    #[must_use]
+    pub fn with_store(
+        schema: &'a ShatterSchema,
+        router: &'a Router,
+        derivation_key: [u8; 32],
+        store: Arc<OrphanStore>,
+    ) -> Self {
+        Self {
             schema,
             router,
             derivation_key: Zeroizing::new(derivation_key),
-            orphans: Mutex::new(loaded),
-            orphan_log: Some(log),
-        })
+            store,
+        }
     }
 
     /// Shreds `record` under `shard`.
@@ -103,11 +112,7 @@ impl<'a> Shredder<'a> {
 
     /// Number of orphan fragments waiting for [`Shredder::reap`].
     pub fn pending_orphans(&self) -> Result<usize, ShatterError> {
-        Ok(self
-            .orphans
-            .lock()
-            .map_err(|_| ShatterError::Internal)?
-            .len())
+        self.store.pending()
     }
 
     /// Retries every queued orphan delete once.
@@ -121,7 +126,13 @@ impl<'a> Shredder<'a> {
         }
         // Take the batch out so the lock is not held during vault calls. Orphans
         // queued meanwhile are merged back below.
-        let batch = std::mem::take(&mut *self.orphans.lock().map_err(|_| ShatterError::Internal)?);
+        let batch = std::mem::take(
+            &mut *self
+                .store
+                .queue
+                .lock()
+                .map_err(|_| ShatterError::Internal)?,
+        );
         let mut report = ReapReport {
             removed: 0,
             still_pending: 0,
@@ -129,7 +140,7 @@ impl<'a> Shredder<'a> {
         };
         let mut keep = Vec::new();
         for mut orphan in batch {
-            match self.router.delete(orphan.vault, &orphan.id) {
+            match self.router.delete_maintenance(orphan.vault, &orphan.id) {
                 Ok(_) => report.removed += 1,
                 Err(_) => {
                     orphan.attempts += 1;
@@ -142,9 +153,13 @@ impl<'a> Shredder<'a> {
                 }
             }
         }
-        let mut queue = self.orphans.lock().map_err(|_| ShatterError::Internal)?;
+        let mut queue = self
+            .store
+            .queue
+            .lock()
+            .map_err(|_| ShatterError::Internal)?;
         queue.extend(keep);
-        if let Some(log) = &self.orphan_log {
+        if let Some(log) = &self.store.log {
             // Orphans that were removed above may still be in the file if this write
             // fails. A later reap deletes them again, which is harmless.
             log.replace(&queue)?;
@@ -157,8 +172,12 @@ impl<'a> Shredder<'a> {
     /// The disk write happens first. If it fails, the orphans are still queued in RAM,
     /// so the caller can still report the original write failure.
     fn enqueue(&self, failed: Vec<Orphan>) -> Result<(), ShatterError> {
-        let mut queue = self.orphans.lock().map_err(|_| ShatterError::Internal)?;
-        let persisted = match &self.orphan_log {
+        let mut queue = self
+            .store
+            .queue
+            .lock()
+            .map_err(|_| ShatterError::Internal)?;
+        let persisted = match &self.store.log {
             Some(log) => log.append(&failed),
             None => Ok(()),
         };
@@ -227,7 +246,7 @@ impl<'a> Shredder<'a> {
             let failed: Vec<Orphan> = plan
                 .iter()
                 .filter(|p| written.contains(&p.vault))
-                .filter(|p| router.delete(p.vault, &p.id).is_err())
+                .filter(|p| router.delete_maintenance(p.vault, &p.id).is_err())
                 .map(|p| Orphan {
                     vault: p.vault,
                     id: p.id.clone(),

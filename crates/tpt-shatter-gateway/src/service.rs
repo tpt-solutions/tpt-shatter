@@ -72,7 +72,10 @@ pub const fn public_error(error: ShatterError) -> (u16, &'static str) {
         ShatterError::InvalidToken | ShatterError::TokenExpired | ShatterError::Unauthorized => {
             (401, "unauthorized")
         }
-        ShatterError::InvalidShardKey | ShatterError::InvalidParameter => (400, "bad_request"),
+        // An unknown field name is the client's error on the write path.
+        ShatterError::InvalidShardKey
+        | ShatterError::InvalidParameter
+        | ShatterError::InvalidSchema => (400, "bad_request"),
         ShatterError::Reconstruction => (404, "not_found"),
         ShatterError::RateLimited => (429, "rate_limited"),
         ShatterError::VaultUnavailable { .. } => (503, "unavailable"),
@@ -211,7 +214,7 @@ pub fn ready(breakers_open: &[bool]) -> bool {
     !breakers_open.iter().any(|open| *open)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         let _ = write!(out, "{b:02x}");

@@ -7,7 +7,8 @@ use crate::error::ShatterError;
 
 /// Identifies one of the three isolated vaults.
 ///
-/// Each vault is a separate tpt-keystone-db instance. Labels are the letters
+/// Each vault is a separate store with its own directory and key (see `FileVault`).
+/// Labels are the letters
 /// A, B, and C. Each vault also has a domain-separation tag for keyed derivations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum VaultId {

@@ -13,15 +13,15 @@ Resolve these before the implementation phases that depend on them.
 - [x] Write allow-list of acceptable licenses (MIT, BSD-2/3, ISC, Unlicense, Zlib, MIT/Apache-2.0 dual, etc.) (`deny.toml`)
 - [x] List spec items that are Apache-only and decide replacements (DECISIONS.md: axum -> hyper, tonic/prost -> HTTP/JSON, parquet/arrow dropped; OpenTelemetry deferred, `tracing` chosen, DECISIONS.md Observability)
 - [ ] Audit licenses of planned deps: axum, tonic, tokio, hmac, sha2, rand, zeroize, serde, thiserror, prost (check each) — PARTIAL: checked with `cargo info` and `cargo deny`; `rand` not yet used
-- [x] Verify `tpt-keystone-db` license is compatible (GitHub)
+- [x] (Historical, keystone dropped) Verify `tpt-keystone-db` license is compatible (GitHub)
 - [x] Verify `tpt-strata` and `tpt-strata-parquet` licenses are compatible (GitHub)
 - [x] Verify Parquet-related transitive deps (arrow/parquet crates are Apache-only?) and decide whether `tpt-strata-parquet` can be used
 
 ### Upstream integration
 - [x] Record GitHub URLs, commit/tag pins for tpt-keystone-db and tpt-strata
-- [x] Review tpt-keystone-db Rust API / wire protocol; choose native API vs wire client
-- [x] Confirm keystone supports SCRAM-SHA-256 + TLS as the spec assumes (supported but opt-in; deployment config must enable it)
-- [ ] Confirm keystone exposes a query log / audit hook the canary can tail; if not, file/implement the feature upstream — PARTIAL: audit log is table `_mirror_audit`, readable by polling; no stream; query text capture unverified (UPSTREAM.md)
+- [x] (Historical, keystone dropped) Review tpt-keystone-db Rust API / wire protocol; choose native API vs wire client
+- [x] (Historical, keystone dropped) Confirm keystone supports SCRAM-SHA-256 + TLS as the spec assumes (supported but opt-in; deployment config must enable it)
+- [-] (Superseded: keystone dropped.) Confirm keystone exposes a query log / audit hook the canary can tail; if not, file/implement the feature upstream — PARTIAL: audit log is table `_mirror_audit`, readable by polling; no stream; query text capture unverified (UPSTREAM.md)
 - [ ] Review tpt-strata embedding API (in-process ingest, group by, sum) and its durability model — PARTIAL: `Table`/`QueryBuilder` found; group-by/sum names and durability not documented upstream (UPSTREAM.md); decided JSONL is the durable copy (DECISIONS.md)
 - [x] Confirm tpt-strata never needs a separate server process
 
@@ -101,7 +101,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] TTL enforcement (default 60s) with bounded clock-skew tolerance
 - [x] Bind token to ShardKey and action scopes
 - [x] Signing key versioning + instant rotation (invalidate all active tokens)
-- [ ] Token issuer service/endpoint (called by host app after upstream auth)
+- [x] Token issuer service/endpoint (called by host app after upstream auth) — built in `tpt-shatter-node` (`POST /v1/tokens`): bearer secrets stored as SHA-256, scope and TTL policy per caller, delete never issuable, issuance audited to a keyed chain before release (tested, and smoke-tested end to end over HTTP). Gaps: no caller field in audit events; caller auth is secrets only unless client_ca is set
 - [x] Replay-resistance decision implemented (e.g. nonce/short TTL only) and documented
 - [x] Unit tests: expiry, tamper, wrong scope, wrong shard, wrong key, rotated key
 - [ ] Fuzz tests for token parser (partial: proptest stand-in in place; real cargo-fuzz targets still pending)
@@ -111,18 +111,23 @@ Resolve these before the implementation phases that depend on them.
 
 ## Phase 5 — `tpt-shatter-vault-client` & Vaults
 - [ ] Typed read/write ops per vault schema (A, B, C) — PARTIAL: generic per-vault ops done; schema-typed layer pending
-- [ ] Connection pooling — PARTIAL: pending real backend
+- [x] Connection pooling — N/A: no network connections to vaults (`FileVault`)
 - [x] Enforce single-vault queries only (no cross-vault joins at client level)
-- [ ] TLS + SCRAM-SHA-256 connection setup — PARTIAL: pending real tpt-keystone-db backend
+- [x] TLS + SCRAM-SHA-256 connection setup — N/A: keystone dropped; vaults are local `FileVault` directories (DECISIONS.md, "Vault storage")
 - [ ] Timeouts, retries, circuit breaker per vault — PARTIAL: breaker and bounded retries done; per-request timeouts pending
 - [x] Vault connection status reporting (for observability)
 - [x] Delete-by-FragmentId operation (needed for GDPR)
 - [x] Mock/in-memory vault implementation for tests
-- [ ] `vaults/vault-frag-a` config: tpt-keystone-db instance (identity)
-- [ ] `vaults/vault-frag-b` config: tpt-keystone-db instance (demographic)
-- [ ] `vaults/vault-frag-c` config: tpt-keystone-db instance (financial/sensitive)
-- [ ] Per-vault credentials and separate secrets; no shared creds
-- [ ] Storage config (S3/local-fs + NVMe cache-aside), no replication between vaults
+- [x] Internal vault store `FileVault` (replaces keystone): ChaCha20-Poly1305 per fragment with vault label and FragmentId as associated data, atomic writes, overwrite-then-remove erasure, temp-file cleanup on open (tested, including tamper, wrong key, and cross-vault copy)
+- [ ] `FileVault` gaps — PARTIAL: no replication, no backups, overwrite erasure not guaranteed on SSD/CoW volumes (key destruction not wired), no key delivery
+- [x] Node process `tpt-shatter-node` (new crate): JSON config with unknown fields rejected, keys from the environment, TLS required by default, one router with the canary observer, gateway over the assembler, reaper and canary-monitor threads (tested: record round trip, canary read rotates the token key; smoke-tested over HTTP)
+- [x] Ingestion write path — `PUT /v1/records/{shard}` with a `Write`-scoped token: `Writer` in the gateway (rate limit, scope check, uniform errors, never echoes the record), a 64 KiB body limit, unknown fields refused as 400, and one shared orphan store so reaper and ingestion agree (tested at unit, HTTP, and node level)
+- [ ] Node gaps — PARTIAL: keys from environment (no secret store), no container image or supervisor, one node per vault directory (no lock); the write path was tested in-process, not with a live HTTP write from a token minted outside the node
+- [ ] `vaults/vault-frag-a` config: FileVault directory and sealing key (identity) — PARTIAL: `FileVault` built; per-vault config and key delivery pending
+- [ ] `vaults/vault-frag-b` config: FileVault directory and sealing key (demographic) — PARTIAL: as above
+- [ ] `vaults/vault-frag-c` config: FileVault directory and sealing key (financial/sensitive) — PARTIAL: as above
+- [ ] Per-vault credentials and separate secrets; no shared creds — PARTIAL: each vault has its own sealing key by construction; key delivery pending
+- [ ] Storage config: one volume per vault, no replication between vaults — PARTIAL: one directory per vault in `FileVault`; volume layout not built
 - [ ] Per-vault automated backup config
 - [x] Docs + license headers
 
@@ -138,7 +143,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Securely zero original record after dispatch
 - [ ] Internal gRPC (tonic) ingestion service with mTLS — PARTIAL: pending: needs tonic and mTLS
 - [ ] Derivation key loading (RAM only, from provisioning mechanism) — PARTIAL: caller supplies key; RAM-only provisioning pending (Phase 11)
-- [ ] Orphan fragment reaper (background) — PARTIAL: `Shredder::reap` with bounded retries and abandonment (tested); orphan queue is durable via `Shredder::with_orphan_log` (atomic rewrite, restart test); attempt counts reset on restart; no background task yet; abandoned orphans cannot be located again (the queue holds FragmentIds, not ShardKeys) and raise no alarm yet
+- [ ] Orphan fragment reaper (background) — PARTIAL: `Shredder::reap` with bounded retries and abandonment (tested); `run_reaper` runs passes on an interval until stopped (tested); orphan queue is durable via `Shredder::with_orphan_log` (atomic rewrite, restart test); attempt counts reset on restart; abandoned orphans cannot be located again (the queue holds FragmentIds, not ShardKeys); the abandonment alarm is a callback hook, with no notification channel yet and no deployed scheduler
 - [x] Unit + integration tests with synthetic records
 - [x] Docs + license headers
 
@@ -179,7 +184,7 @@ Resolve these before the implementation phases that depend on them.
 ## Phase 9 — `tpt-shatter-gateway`
 - [x] HTTP/JSON server — hyper 1 (MIT) in `crates/tpt-shatter-gateway/src/http.rs`; axum avoided because it pulls sync_wrapper (Apache-only). TLS is separate (below)
 - [x] Capability token validation (HMAC, TTL, scope)
-- [ ] Rate limiting (per token hash / per source) — PARTIAL: per token hash done; per source address needs the HTTP layer
+- [x] Rate limiting (per token hash / per source) — per token hash in `Gateway::read`; per source IP (digest of the peer address, port excluded) on `/v1/records` in `http.rs`, refused with 429 before the token check; tested. Not set by default: deployment must pass a `source_limiter`
 - [ ] Route validated requests to the assembler (gRPC, mTLS) — PARTIAL: in-process RecordSource trait done; transport decided as HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md); assembler client and mTLS pending
 - [x] Return responses; uniform error responses that leak nothing
 - [x] Logs only token hashes and metadata
@@ -195,12 +200,12 @@ Resolve these before the implementation phases that depend on them.
 ## Phase 10 — `tpt-shatter-canary`
 - [ ] Canary record generator (synthetic high-value records, realistic-looking) — PARTIAL: structured records, not yet realistic
 - [x] Secret deterministic prefix scheme
-- [ ] Periodic injection into all vaults — PARTIAL: plan supports injection; scheduler pending
-- [ ] Canary refresh/rotation schedule — PARTIAL: epoch primitives done (`CanaryPlan::for_epoch`, `epoch_at`); scheduler that calls them and injects pending
-- [ ] Vault query-log tailer (per vault) — PARTIAL: pending
-- [ ] Detect canary FragmentId in query logs — PARTIAL: detection on supplied IDs done; log tailing pending
-- [x] Alarm: rotate HMAC signing key, invalidate all tokens — PARTIAL: via Responder trait; wiring to the token Signer pending
-- [ ] Alarm: notify security (webhook/email/pager integration) — PARTIAL: via Responder trait; real channel pending
+- [x] Periodic injection into all vaults: `refresh_canaries` writes the current epoch through the shredder and erases the previous one, in that order, and is idempotent (tested); `monitor_loop` in `tpt-shatter-node/src/main.rs` calls it each `monitor_interval_secs`
+- [x] Canary refresh/rotation schedule: `CanaryRotation` gives the current epoch's plan, `refresh_canaries` applies it (tested), `canary_period_secs` in node config (default 7 days), and `monitor_loop` runs it on a timer
+- [-] Vault query-log tailer (per vault) — superseded: vaults are internal now, so detection runs in the router instead of tailing a database log
+- [ ] Detect canary FragmentId in query logs — PARTIAL (renamed in scope: in-band, not query logs): `Router::with_observer` + `CanaryWatch` alarm on each observed read or delete of a canary FragmentId; writes and `*_maintenance` paths are not observed, so rotation and erasure do not alarm (tested). `CanaryMonitor::poll` runs the response and logs each alarm, and requeues on failure (tested). `monitor_loop` calls `poll` on a timer; direct file access on the host is not seen
+- [x] Alarm: rotate HMAC signing key, invalidate all tokens: `AlarmResponder` in `tpt-shatter-node` rotates the node's token `Signer` (tested end to end: `a_canary_read_through_the_node_rotates_the_token_key`)
+- [ ] Alarm: notify security (webhook/email/pager integration) — PARTIAL: `AlertLog` (append-only JSON-lines, fsynced, forbids value-bearing keys) is the channel; `Alarm::record` and `run_reaper` write to it (tested). Pager/SIEM tailing of the file and webhook delivery are not built
 - [x] Alarm event logging (event only, never canary values)
 - [x] Rate-limited alarm handling to avoid alert storms; manual re-arm procedure
 - [ ] Management-subnet-only access to vaults and gateway
@@ -213,7 +218,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Deletion orchestrator service (delete by FragmentId across all vaults)
 - [x] Deletion verification and idempotency
 - [ ] Backup handling for erased subjects (expiry or tombstone replay on restore)
-- [ ] Retention policy enforcement (TTL on fragments) — PARTIAL: `RetentionPolicy` done in common; purge job and vault TTL wiring pending
+- [x] Retention policy enforcement (TTL on fragments): `FileVault` stores each fragment's stored-at time under the AEAD (`nonce || stored_at || sealed`); `FileVault::purge_expired` erases expired files and leaves any that fail to authenticate (tested); the node runs it on `purge_interval_secs` and requires `retention_secs >= canary_period_secs`. Scope: existing fragment files from before this change are unreadable (no migration); purge is per fragment, so a record can lose some fragments before others, which the assembler reports as a failed read
 
 ### Audit trail
 - [x] Define audit event schema (who/what/when via token hash and shard hash, no payload)
@@ -282,7 +287,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Pen test: token replay, tamper, expiry
 - [ ] Pen test: extract data from assembler disk image (expect nothing)
 - [ ] Fuzzing for token parser and gRPC inputs
-- [ ] Log-scan test: no sensitive values in logs
+- [x] Log-scan test: no sensitive values in logs — `logs_and_alerts_never_contain_values_tokens_or_shard_keys` (node) checks every access-log line for reads and writes, successful and refused, plus the alert log after an alarm. Scope: the log lines as generated, not a live HTTP capture or stderr output
 - [ ] Load/latency benchmarks for read path
 - [x] CI runs all non-infrastructure tests
 

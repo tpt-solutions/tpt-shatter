@@ -17,5 +17,6 @@ workspace = true
 
 [dependencies]
 tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
+tpt-shatter-shredder = { version = "0.1.0", path = "../tpt-shatter-shredder" }
 tpt-shatter-vault-client = { version = "0.1.0", path = "../tpt-shatter-vault-client" }
 zeroize = "1.9.1"

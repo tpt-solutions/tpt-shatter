@@ -26,7 +26,7 @@ pub fn erase(
     let mut rows_removed = 0;
     for vault in VaultId::ALL {
         let id = derive_fragment_id(derivation_key, shard, vault)?;
-        if router.delete(vault, &id)? {
+        if router.delete_maintenance(vault, &id)? {
             rows_removed += 1;
         }
     }
@@ -34,7 +34,8 @@ pub fn erase(
     let mut verified = true;
     for vault in VaultId::ALL {
         let id = derive_fragment_id(derivation_key, shard, vault)?;
-        if router.get(vault, &id)?.is_some() {
+        // Presence check for maintenance. Not observed, so erasure cannot trip a canary.
+        if router.contains_maintenance(vault, &id)? {
             verified = false;
         }
     }

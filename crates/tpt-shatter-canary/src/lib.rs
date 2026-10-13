@@ -8,18 +8,33 @@
 //! FragmentId in a set of queried IDs. [`AlarmGate`] turns detections into one
 //! response: rotate the signing key, notify security, then disarm until a human re-arms.
 //!
-//! Not implemented yet: the vault query-log tailer (depends on the keystone audit
-//! feature, see UPSTREAM.md), the refresh and rotation schedule, realistic record
-//! generation (values are structured but not realistic), and the notification
-//! channel itself.
+//! [`CanaryRotation`] gives the plan for the current epoch and says when a refresh is
+//! due. [`Alarm::record`] writes a detection to the security alert log, which is the
+//! notification channel.
+//!
+//! Not implemented yet: a timer loop that calls [`refresh_canaries`], in-band detection
+//! in the vault client (the planned replacement for query-log tailing, now that the
+//! vaults are internal), and
+//! realistic record generation (values are structured but not realistic).
 
 use std::collections::HashMap;
 
+use tpt_shatter_common::AlertLog;
 use tpt_shatter_common::{
     FragmentId, Record, SHARD_KEY_LEN, ShardKey, ShatterError, ShatterSchema, VaultId,
 };
 use tpt_shatter_vault_client::{derive_fragment_id, keyed_digest};
 use zeroize::Zeroizing;
+
+mod inject;
+mod monitor;
+mod rotation;
+mod watch;
+
+pub use inject::refresh_canaries;
+pub use monitor::CanaryMonitor;
+pub use rotation::CanaryRotation;
+pub use watch::CanaryWatch;
 
 const SHARD_DOMAIN: &[u8] = b"tpt-shatter/canary/shard/v1";
 const PREFIX_DOMAIN: &[u8] = b"tpt-shatter/canary/prefix/v1";
@@ -126,6 +141,24 @@ pub struct Alarm {
     pub vault: VaultId,
     /// Which canary was touched.
     pub index: usize,
+}
+
+impl Alarm {
+    /// Writes this alarm to the security alert log at time `at` (Unix seconds).
+    ///
+    /// Only the vault label and canary index are written. A responder calls this from
+    /// [`Responder::notify_security`] to implement the notification channel.
+    pub fn record(&self, log: &AlertLog, at: u64) -> Result<(), ShatterError> {
+        let index = self.index.to_string();
+        log.append(
+            "canary_alarm",
+            at,
+            &[
+                ("vault", &self.vault.label().to_string()),
+                ("index", &index),
+            ],
+        )
+    }
 }
 
 /// Recognizes canary FragmentIds among queried IDs.
@@ -400,6 +433,27 @@ mod tests {
             })
             .collect();
         assert!(detector.scan(&real).is_empty());
+    }
+
+    #[test]
+    fn alarm_is_written_to_the_alert_log_with_only_vault_and_index() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("tpt-shatter-canary-alert-{nanos}.jsonl"));
+        let log = AlertLog::open(&path).expect("open");
+        Alarm {
+            vault: VaultId::C,
+            index: 7,
+        }
+        .record(&log, 1234)
+        .expect("record");
+        let text = std::fs::read_to_string(&path).expect("read");
+        std::fs::remove_file(&path).expect("cleanup");
+        assert!(text.contains(r#""kind":"canary_alarm""#));
+        assert!(text.contains(r#""vault":"C""#));
+        assert!(text.contains(r#""index":"7""#));
+        assert!(text.contains(r#""at":1234"#));
     }
 
     #[test]

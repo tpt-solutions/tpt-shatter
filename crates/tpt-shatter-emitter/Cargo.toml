@@ -19,4 +19,5 @@ workspace = true
 tpt-shatter-anonymize = { version = "0.1.0", path = "../tpt-shatter-anonymize" }
 tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
 serde_json = "1"
+tpt-strata = { version = "1.0.1", git = "https://github.com/tpt-solutions/tpt-strata", rev = "0439970ca3fd371be2d2696f308445cf5987ca4f" }
 zeroize = "1.9.1"
