@@ -2,6 +2,7 @@
 // Copyright (c) 2026 TPT Solutions
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tpt_shatter_common::{FragmentId, ShatterError, VaultId};
@@ -31,6 +32,10 @@ pub struct BreakerConfig {
     pub cooldown_secs: u64,
     /// Total attempts per operation (1 means no retry). Retries are immediate; backoff is pending.
     pub attempts: u32,
+    /// Calls allowed in flight at once. A call that would exceed this fails at once with
+    /// `VaultUnavailable`. A stalled vault cannot pile up threads past this bound, because a
+    /// stalled call never returns and so never trips the breaker.
+    pub max_in_flight: u32,
 }
 
 impl Default for BreakerConfig {
@@ -39,6 +44,7 @@ impl Default for BreakerConfig {
             failure_threshold: 5,
             cooldown_secs: 30,
             attempts: 2,
+            max_in_flight: 64,
         }
     }
 }
@@ -63,6 +69,8 @@ pub struct VaultStatus {
     pub state: BreakerState,
     /// Consecutive failed operations since the last success.
     pub consecutive_failures: u32,
+    /// Calls running now, including stalled ones the breaker has not seen fail.
+    pub in_flight: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +131,17 @@ pub struct Guarded {
     config: BreakerConfig,
     clock: Clock,
     breaker: Mutex<Breaker>,
+    in_flight: AtomicU32,
+}
+
+/// Holds one in-flight slot for the length of a call. Dropping it frees the slot, even if the
+/// backend panics.
+struct InFlightSlot<'a>(&'a AtomicU32);
+
+impl Drop for InFlightSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Guarded {
@@ -137,6 +156,7 @@ impl Guarded {
                 phase: Phase::Closed,
                 failures: 0,
             }),
+            in_flight: AtomicU32::new(0),
         }
     }
 
@@ -153,6 +173,7 @@ impl Guarded {
             vault: self.vault(),
             state: breaker.state(),
             consecutive_failures: breaker.failures,
+            in_flight: self.in_flight.load(Ordering::SeqCst),
         })
     }
 
@@ -175,6 +196,13 @@ impl Guarded {
         &self,
         op: impl Fn(&dyn VaultBackend) -> Result<T, ShatterError>,
     ) -> Result<T, ShatterError> {
+        let slot = self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _slot = InFlightSlot(&self.in_flight);
+        if slot >= self.config.max_in_flight {
+            return Err(ShatterError::VaultUnavailable {
+                vault: self.vault(),
+            });
+        }
         let now = (self.clock)();
         if !self.lock()?.allow(now) {
             return Err(ShatterError::VaultUnavailable {
@@ -263,6 +291,7 @@ mod tests {
             failure_threshold: 2,
             cooldown_secs: 30,
             attempts: 1,
+            max_in_flight: 64,
         };
         let (g, vault, _) = setup(config);
         vault.set_available(false);
@@ -281,6 +310,7 @@ mod tests {
             failure_threshold: 1,
             cooldown_secs: 10,
             attempts: 1,
+            max_in_flight: 64,
         };
         let (g, vault, now) = setup(config);
         vault.set_available(false);
@@ -298,6 +328,7 @@ mod tests {
             failure_threshold: 1,
             cooldown_secs: 10,
             attempts: 1,
+            max_in_flight: 64,
         };
         let (g, vault, now) = setup(config);
         vault.set_available(false);
@@ -331,6 +362,7 @@ mod tests {
             failure_threshold: 1,
             cooldown_secs: 10,
             attempts: 3,
+            max_in_flight: 64,
         };
         let g = Guarded::new(Box::new(Rejecting), config, system_clock());
         for _ in 0..3 {
@@ -339,5 +371,89 @@ mod tests {
         let status = g.status().expect("status");
         assert_eq!(status.state, BreakerState::Closed);
         assert_eq!(status.consecutive_failures, 0);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// A vault whose `get` blocks until the test sends a release.
+    struct StallingVault {
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl VaultBackend for StallingVault {
+        fn vault(&self) -> VaultId {
+            VaultId::A
+        }
+
+        fn put(&self, _: &FragmentId, _: &[u8]) -> Result<(), ShatterError> {
+            Ok(())
+        }
+
+        fn get(&self, _: &FragmentId) -> Result<Option<Zeroizing<Vec<u8>>>, ShatterError> {
+            let _ = self
+                .release
+                .lock()
+                .map_err(|_| ShatterError::Internal)?
+                .recv();
+            Ok(None)
+        }
+
+        fn delete(&self, _: &FragmentId) -> Result<bool, ShatterError> {
+            Ok(false)
+        }
+    }
+
+    fn id() -> FragmentId {
+        FragmentId::from_bytes([1; 32])
+    }
+
+    #[test]
+    fn a_stalled_vault_cannot_hold_more_calls_than_the_cap() {
+        let (release, stalled) = mpsc::channel();
+        let config = BreakerConfig {
+            attempts: 1,
+            max_in_flight: 2,
+            ..BreakerConfig::default()
+        };
+        let guard = Arc::new(Guarded::new(
+            Box::new(StallingVault {
+                release: Mutex::new(stalled),
+            }),
+            config,
+            Box::new(|| 0),
+        ));
+
+        let blocked: Vec<_> = (0..2)
+            .map(|_| {
+                let guard = Arc::clone(&guard);
+                thread::spawn(move || guard.get(&id()))
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while guard.in_flight.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "the calls never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // The third call is refused at once, and it gives its slot back.
+        assert_eq!(
+            guard.get(&id()).err(),
+            Some(ShatterError::VaultUnavailable { vault: VaultId::A })
+        );
+        assert_eq!(guard.in_flight.load(Ordering::SeqCst), 2);
+
+        release.send(()).expect("release");
+        release.send(()).expect("release");
+        for handle in blocked {
+            assert_eq!(handle.join().expect("join"), Ok(None));
+        }
+        assert_eq!(guard.in_flight.load(Ordering::SeqCst), 0);
     }
 }

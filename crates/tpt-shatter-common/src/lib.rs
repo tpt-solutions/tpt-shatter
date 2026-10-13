@@ -31,6 +31,6 @@ pub use record::Record;
 pub use retention::RetentionPolicy;
 pub use schema::ShatterSchema;
 pub use shard_key::{SHARD_KEY_LEN, ShardKey};
-pub use token::{CapabilityToken, DEFAULT_TOKEN_TTL_SECS, Scope, Scopes};
+pub use token::{CALLER_TAG_LEN, CapabilityToken, DEFAULT_TOKEN_TTL_SECS, Scope, Scopes};
 pub use vault::VaultId;
 pub use zero::SecureZero;

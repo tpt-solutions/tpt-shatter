@@ -101,8 +101,8 @@ that is said. Changing a decision means editing this file and the checklist toge
 
 ## Keys and disaster recovery
 
-- **Key delivery:** keys are unwrapped at boot from a KMS-held wrapping key, then kept
-  in RAM only. Not built.
+- **Key delivery:** keys are unsealed at boot from a KEK-sealed blob into a tmpfs key
+  directory, then kept in RAM only. Built as `tpt-shatter-kek`; see the decision at the end.
 - **Custody:** split across three custodians, 2-of-3 to recover.
 - **Backups:** per-vault, encrypted, with a recovery point objective of 24 hours and a
   recovery time objective of 4 hours. Restore drills are quarterly.
@@ -124,11 +124,22 @@ that is said. Changing a decision means editing this file and the checklist toge
 
 ## Observability
 
-- **Logging: `tracing` (MIT), structured JSON.** Not built yet. Sensitive values are
-  wrapped in redacting types so they cannot be formatted.
-- **OTLP export: deferred.** The OpenTelemetry Rust crates are Apache-2.0, so they are
-  not used. Until an MIT-compatible OTLP exporter is verified, logs go to stdout as JSON
-  and a collector agent ships them. The gateway's access log already follows this shape.
+- **Logging: `tracing` (MIT), structured JSON.** Built. The node binary writes one JSON
+  object per line to stderr. Events carry counts, status codes, and token hashes, never
+  values, tokens, or shard keys. Sensitive values sit in types whose `Debug` output hides
+  them. The leak test covers the access and alert lines. A static lint is still open.
+- **Metrics: Prometheus text on a separate listener.** `metrics_listen` (off by default)
+  serves `GET /metrics` in Prometheus text format, version 0.0.4. It is for the management
+  network, not the read path. Labels use fixed vocabulary only: HTTP status, the gateway's
+  public code, and vault label. No value, token, or shard key appears in a sample. The
+  text is hand-rendered, so no new metrics crate is needed.
+- **OTLP export: through an OpenTelemetry Collector, not in-process (decided).** The
+  OpenTelemetry Rust crates are Apache-2.0 only, so they are not linked. A Collector runs
+  beside each node as a separate deploy-time process. It reads the node's JSON logs from
+  stdout and scrapes `/metrics`, then exports OTLP. The license policy covers linked crates,
+  so this is not a linked dependency. An in-process exporter, built as a workspace crate, is
+  deferred until a deployment cannot run a sidecar. That is the one fact that would change
+  this decision. The gateway's access log already follows this shape.
 
 ## Analytics durability (added after the upstream check)
 
@@ -258,6 +269,87 @@ that is said. Changing a decision means editing this file and the checklist toge
   returned. If the append fails, the token is withheld. After a failed write the store
   refuses further records until restart, because the in-memory chain is then ahead of the
   file. A restart verifies the whole chain before resuming it.
-- **Known gaps:** the audit event has no caller field, so the chain cannot say which caller
-  issued a token. The access log carries the caller name. Adding the field changes the
-  event format and needs a decision on how caller names are recorded.
+- **Caller identity:** the audit chain records the caller of each issuance, read, and write
+  as a keyed digest of the caller tag (see the decisions at the end of this file). The
+  access log still carries the caller name.
+
+## BI access (decided)
+
+- **Scheduled exports write CSV files to a local directory.** `analytics.exports` names the
+  CSVs and `analytics.export_dir` names where they go. The node rewrites them every
+  `analytics.export_interval_secs`. Each file is renamed into place, so a reader never sees a
+  partial file. Export file names must be plain names, not paths.
+- **No network endpoint for BI.** A query endpoint would need its own authentication, a
+  network path to the analytics subnet, and a decision about who may query which groups. None
+  of that is built, so the first BI path is a file, and a later endpoint needs its own
+  decision.
+- **Exports apply the same rules as the one-off command.** Only events inside the retention
+  window count, groups under `k` are left out, and spreadsheet formula characters are guarded.
+
+## Decisions taken on the open items (2026-10-13)
+
+- **Vault isolation: each vault becomes its own service.** Decided, not yet built. Each vault
+  runs as a separate process on its own host, with its own sealing key and its own storage.
+  The node becomes the router: it calls each vault over mTLS, and holds no vault key that
+  another vault could use. The first step is a vault service exposing the `put`, `get`,
+  `delete`, and `contains` operations the router already uses, behind the same
+  `VaultBackend` trait, so the router and assembler do not change. Until this is built, the
+  node is a single trust domain and must be described that way.
+- **Key delivery: a key directory on tmpfs.** `TPT_KEYS_DIR` names a directory holding one
+  file per key, named as in `KEY_VARS`, each with 64 hex characters. On Unix, a file readable
+  or writable by group or others is refused. The boot step writes the directory from the
+  sealed key material, so the KEK never reaches the node. The `TPT_KEY_*`
+  environment variables remain for development only, since they leak through `/proc` and
+  child processes. The KEK tool (see the end of this file) is the on-prem path.
+- **Caller identity in the audit chain.** Tokens are now version 2. Each token carries a
+  16-byte caller tag, the first 16 bytes of SHA-256 of the caller's name. The tag is covered
+  by the token signature. The issuer tags every token with its caller, and the gateway passes
+  the verified tag to the audit hook. The chain stores only a keyed digest of the tag. An
+  event without a caller has no `caller` key in its log line and adds nothing to its MAC, so
+  lines from before this change still verify. This was checked against a log written by the
+  pre-change code: it verifies under the current code, and it still verifies after attributed
+  records are appended. Version 1 tokens are refused after the upgrade.
+  Their lifetime is at most 60 seconds, so the switch needs no migration, only that no
+  token issued before the deploy is still expected to work.
+
+## Decisions taken on the remaining open items (2026-10-13, second round)
+
+- **Vault split: built as a service, one per vault.** `tpt-shatter-vault-service` serves one
+  vault over mTLS (HTTP/1.1 over TLS 1.3, one request per connection). Its `RemoteVault`
+  implements `VaultBackend`, so the router, assembler and shredder are unchanged. The node
+  uses `remote_vaults` in place of local directories and then holds no vault keys:
+  `Keys.vaults` is `None`, and the three vault keys are optional together. Each service
+  holds only its own sealing key and runs its own retention purge. Tested over loopback mTLS,
+  including a client without a certificate and a wrong server name, and with a full node
+  round trip through three services. Not yet measured: the cost of one TLS connection per
+  request, which has no pooling or retry. The services are not deployed by any config yet.
+- **Key protection: a narrow KEK tool, not a KMS (`tpt-shatter-kek`).** A KMS was
+  considered and rejected. OpenBao (MPL-2.0) was the first choice, but it is a second
+  system to run and secure for one wrapping key, and no MIT server alternative was found.
+  Building a general KMS would add a high-value component that we would be the least
+  reviewed on. What the node needs is one key-encryption key (KEK) that is kept outside it.
+  The tool seals the node's keys under a random KEK with ChaCha20-Poly1305, and splits the
+  KEK 2-of-3 among custodians with Shamir's scheme. Unseal writes the keys into
+  `TPT_KEYS_DIR` on a tmpfs.
+  - **Shamir library: `blahaj` 0.6.0 (MIT).** `sharks` 0.5.0 was the first choice. It is
+    rejected because RUSTSEC-2024-0398 says its coefficients are drawn from 1..=255, which
+    biases the shares. `cargo deny` caught it. `blahaj` is the maintained fork and draws from
+    0..=255.
+  - **Not audited.** Neither the Shamir library nor this tool has been independently
+    reviewed. The tool has no access control and no audit log of its own, so the custody
+    procedure in the runbook is part of the security boundary.
+  - **Both custody modes are supported, and the blob records which one it uses.**
+    - *Shamir custody (on-prem):* the KEK is split 2-of-3 among custodians, as above.
+    - *Wrapped custody (cloud):* the KEK is wrapped by the cloud KMS through an
+      operator-supplied program, named only on the command line. The program receives hex
+      on stdin and prints hex on stdout, so the operator writes a small wrapper around the
+      cloud CLI. The blob stores the wrapped KEK. The library has no cloud SDK, so it
+      needs no new licenses, and the cloud service's own audit covers the KEK.
+    - The custody mode is authenticated in the blob header, so a wrapped blob cannot be
+      opened in Shamir mode, or the reverse (tested).
+    - **Not tested against a live cloud KMS.** The wrapped path was run end to end on
+      Windows with a stand-in program; the Unix integration test uses `rev` and was not run
+      on this machine.
+- **Key files for vault services.** Each vault service reads its key from a file of 64 hex
+  characters, refused unless it is mode 0400 or 0600 on Unix, and it never reads the node's
+  keys.

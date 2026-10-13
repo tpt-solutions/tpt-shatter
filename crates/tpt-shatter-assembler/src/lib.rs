@@ -59,6 +59,10 @@ impl<'a> Assembler<'a> {
     /// malformed, or holds a field the schema assigns to a different vault. A vault
     /// outage returns [`ShatterError::VaultUnavailable`]. In every error case the
     /// partially built record is dropped and its values are zeroed.
+    ///
+    /// This call has no deadline. A stalled vault blocks it until the vault answers. Services
+    /// must use [`assemble_with_deadline`] instead. The node does. This method is kept for
+    /// migration and tests.
     pub fn assemble(&self, shard: &ShardKey) -> Result<Record, ShatterError> {
         let bodies = self.fetch(shard)?;
         build_record(self.schema, &bodies)
@@ -464,6 +468,30 @@ mod tests {
             assemble_with_deadline(&schema, &router, &KEY, &shard(), Duration::from_secs(5),).err(),
             Some(ShatterError::Reconstruction)
         );
+    }
+
+    /// Chaos: a read cut short by the deadline (the assembler's caller gives up, as after a
+    /// killed request) returns no record and leaves every fragment in place. A later read
+    /// with the vault responsive reconstructs the full record.
+    #[test]
+    fn an_abandoned_read_leaves_no_partial_state_and_a_later_read_succeeds() {
+        let (schema, router) = timed_router(Duration::from_millis(300));
+        assert_eq!(
+            assemble_with_deadline(&schema, &router, &KEY, &shard(), Duration::from_millis(50))
+                .err(),
+            Some(ShatterError::VaultUnavailable { vault: VaultId::A })
+        );
+        for vault in VaultId::ALL {
+            let id = derive_fragment_id(&KEY, &shard(), vault).expect("id");
+            assert!(
+                router.contains_maintenance(vault, &id).expect("contains"),
+                "fragment for {vault:?} was removed by a failed read"
+            );
+        }
+        let rebuilt =
+            assemble_with_deadline(&schema, &router, &KEY, &shard(), Duration::from_secs(5))
+                .expect("later read");
+        assert_eq!(rebuilt.len(), 3);
     }
 
     #[test]

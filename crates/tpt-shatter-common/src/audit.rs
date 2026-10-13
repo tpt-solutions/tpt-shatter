@@ -92,6 +92,10 @@ pub struct AuditEvent {
     pub token_digest: [u8; AUDIT_DIGEST_LEN],
     /// Keyed digest of the shard key the event concerned.
     pub shard_digest: [u8; AUDIT_DIGEST_LEN],
+    /// Keyed digest of the caller the token was issued to. `None` when the event has no caller:
+    /// alarms, erasures, and tokens issued without a caller tag. Absent from the log line when
+    /// `None`, so lines written before this field existed still verify.
+    pub caller: Option<[u8; AUDIT_DIGEST_LEN]>,
     /// The vault involved, if the event is vault-specific.
     pub vault: Option<VaultId>,
     /// When the event happened (Unix seconds).
@@ -124,7 +128,7 @@ impl AuditRecord {
     #[must_use]
     pub fn encode_line(&self) -> String {
         let vault = self.event.vault.map(|v| v.label().to_string());
-        serde_json::json!({
+        let mut line = serde_json::json!({
             "seq": self.seq,
             "action": self.event.action.code(),
             "token": hex_encode(&self.event.token_digest),
@@ -132,8 +136,11 @@ impl AuditRecord {
             "vault": vault,
             "at": self.event.at,
             "mac": hex_encode(&self.mac),
-        })
-        .to_string()
+        });
+        if let Some(caller) = &self.event.caller {
+            line["caller"] = serde_json::json!(hex_encode(caller));
+        }
+        line.to_string()
     }
 
     /// Parses one line written by [`AuditRecord::encode_line`].
@@ -157,10 +164,16 @@ impl AuditRecord {
             }
             _ => return Err(ShatterError::Internal),
         };
+        let caller = match &value["caller"] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(hex_decode(Some(s))?),
+            _ => return Err(ShatterError::Internal),
+        };
         let event = AuditEvent {
             action,
             token_digest: hex_decode(value["token"].as_str())?,
             shard_digest: hex_decode(value["shard"].as_str())?,
+            caller,
             vault,
             at: value["at"].as_u64().ok_or(ShatterError::Internal)?,
         };
@@ -328,6 +341,11 @@ fn absorb(mac: &mut HmacSha256, seq: u64, prev: &[u8; AUDIT_DIGEST_LEN], event: 
     mac.update(&event.shard_digest);
     mac.update(&[event.vault.map_or(0, |v| v.label() as u8)]);
     mac.update(&event.at.to_be_bytes());
+    // Only events with a caller add bytes, so records written without one hash as before.
+    if let Some(caller) = &event.caller {
+        mac.update(&[1]);
+        mac.update(caller);
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -358,11 +376,42 @@ mod line_tests {
 
     const KEY: [u8; 32] = [0x3C; 32];
 
+    #[test]
+    fn a_caller_is_covered_by_the_mac_and_lines_without_one_still_verify() {
+        let mut chain = AuditChain::new(KEY);
+        let mut attributed = event(AuditAction::Read, None, 1);
+        attributed.caller = Some([7; AUDIT_DIGEST_LEN]);
+        let records = [
+            chain.append(attributed).expect("append"),
+            chain
+                .append(event(AuditAction::Read, None, 2))
+                .expect("append"),
+        ];
+        assert_eq!(verify_chain(KEY, &records), Ok(()));
+
+        // An unattributed record has no caller key at all, so it reads like a line from
+        // before the field existed.
+        assert!(!records[1].encode_line().contains("caller"));
+        let decoded: Vec<AuditRecord> = records
+            .iter()
+            .map(|r| AuditRecord::decode_line(&r.encode_line()).expect("decode"))
+            .collect();
+        assert_eq!(decoded, records);
+
+        let mut forged = records;
+        forged[0].event.caller = Some([8; AUDIT_DIGEST_LEN]);
+        assert!(
+            verify_chain(KEY, &forged).is_err(),
+            "caller changed without breaking the chain"
+        );
+    }
+
     fn event(action: AuditAction, vault: Option<VaultId>, at: u64) -> AuditEvent {
         AuditEvent {
             action,
             token_digest: [0xAA; AUDIT_DIGEST_LEN],
             shard_digest: [0xBB; AUDIT_DIGEST_LEN],
+            caller: None,
             vault,
             at,
         }
@@ -425,6 +474,7 @@ mod tests {
             action,
             token_digest: [1; AUDIT_DIGEST_LEN],
             shard_digest: [2; AUDIT_DIGEST_LEN],
+            caller: None,
             vault: Some(VaultId::B),
             at,
         }

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
 use tpt_shatter_canary::{Alarm, Responder};
-use tpt_shatter_common::{Record, Scope, ShardKey, ShatterError};
+use tpt_shatter_common::{CALLER_TAG_LEN, Record, Scope, ShardKey, ShatterError};
 use tpt_shatter_token::Signer;
 
 use crate::ratelimit::RateLimiter;
@@ -89,10 +89,12 @@ pub const fn public_error(error: ShatterError) -> (u16, &'static str) {
 /// operation, so nothing is read or stored without an audit record (fail closed).
 pub trait AccessAudit: Send + Sync {
     /// Records an authorized `scope` operation on `shard` by `token` at `now` (Unix seconds).
+    /// `caller` is the verified caller tag the token was issued under.
     fn authorized(
         &self,
         scope: Scope,
         token: &str,
+        caller: &[u8; CALLER_TAG_LEN],
         shard: &ShardKey,
         now: u64,
     ) -> Result<(), ShatterError>;
@@ -170,11 +172,11 @@ impl<R: RecordSource> Gateway<R> {
 
         let shard = ShardKey::from_hex(shard_hex)?;
         let signer = self.signer.read().map_err(|_| ShatterError::Internal)?;
-        signer.authorize(token, &shard, Scope::Read, now_ms / 1000)?;
+        let claims = signer.authorize(token, &shard, Scope::Read, now_ms / 1000)?;
         drop(signer);
 
         if let Some(audit) = &self.audit {
-            audit.authorized(Scope::Read, token, &shard, now_ms / 1000)?;
+            audit.authorized(Scope::Read, token, claims.caller(), &shard, now_ms / 1000)?;
         }
         let record = self.source.fetch(&shard)?;
         Ok(record
@@ -300,7 +302,14 @@ mod tests {
     struct RefusingAudit;
 
     impl AccessAudit for RefusingAudit {
-        fn authorized(&self, _: Scope, _: &str, _: &ShardKey, _: u64) -> Result<(), ShatterError> {
+        fn authorized(
+            &self,
+            _: Scope,
+            _: &str,
+            _: &[u8; CALLER_TAG_LEN],
+            _: &ShardKey,
+            _: u64,
+        ) -> Result<(), ShatterError> {
             Err(ShatterError::Internal)
         }
     }

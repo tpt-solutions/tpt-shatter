@@ -113,16 +113,7 @@ impl StrataSink {
     ///
     /// An empty view gives an empty table. A `group` that no event holds is refused.
     pub fn count_by(&self, group: &str) -> Result<Table, ShatterError> {
-        let table = {
-            let state = self.lock()?;
-            if state.events.is_empty() {
-                return Ok(empty_grouped(group, group, AggFunc::Count, DataType::Int64));
-            }
-            require_field(&state.events, group)?;
-            Table::try_new(vec![string_column(&state.events, group)])
-                .map_err(|_| ShatterError::Internal)?
-        };
-        aggregate(&table, group, group, AggFunc::Count)
+        count_by_events(&self.lock()?.events, group)
     }
 
     /// Sum of the numeric `value` field for each distinct `group` value.
@@ -132,20 +123,7 @@ impl StrataSink {
     /// a misleading total. An empty view gives an empty table. A field that no event holds
     /// is refused.
     pub fn sum_by(&self, group: &str, value: &str) -> Result<Table, ShatterError> {
-        let table = {
-            let state = self.lock()?;
-            if state.events.is_empty() {
-                return Ok(empty_grouped(group, value, AggFunc::Sum, DataType::Float64));
-            }
-            require_field(&state.events, group)?;
-            require_field(&state.events, value)?;
-            let columns = vec![
-                string_column(&state.events, group),
-                number_column(&state.events, value)?,
-            ];
-            Table::try_new(columns).map_err(|_| ShatterError::Internal)?
-        };
-        aggregate(&table, group, value, AggFunc::Sum)
+        sum_by_events(&self.lock()?.events, group, value)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, ShatterError> {
@@ -159,6 +137,61 @@ impl EventSink for StrataSink {
         let items: Vec<Stamped> = batch.iter().map(|e| (at, e.clone())).collect();
         self.append(&items)
     }
+}
+
+/// Reads a log without opening it for writing. A missing file is an empty log. Any
+/// malformed line fails the whole read, so a torn write is never silently skipped.
+pub fn read_log(path: &Path) -> Result<Vec<Stamped>, ShatterError> {
+    match File::open(path) {
+        Ok(file) => BufReader::new(file)
+            .lines()
+            .map(|line| {
+                let line = line.map_err(|_| ShatterError::Internal)?;
+                decode(&line)
+            })
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(_) => Err(ShatterError::Internal),
+    }
+}
+
+/// Row count per distinct `group` value over `events`. See [`StrataSink::count_by`].
+pub fn count_by_events(events: &[Stamped], group: &str) -> Result<Table, ShatterError> {
+    if events.is_empty() {
+        return Ok(empty_grouped(group, group, AggFunc::Count, DataType::Int64));
+    }
+    require_field(events, group)?;
+    let table =
+        Table::try_new(vec![string_column(events, group)]).map_err(|_| ShatterError::Internal)?;
+    aggregate(&table, group, group, AggFunc::Count)
+}
+
+/// Sum of `value` per distinct `group` value over `events`. See [`StrataSink::sum_by`].
+pub fn sum_by_events(events: &[Stamped], group: &str, value: &str) -> Result<Table, ShatterError> {
+    if events.is_empty() {
+        return Ok(empty_grouped(group, value, AggFunc::Sum, DataType::Float64));
+    }
+    require_field(events, group)?;
+    require_field(events, value)?;
+    let columns = vec![string_column(events, group), number_column(events, value)?];
+    let table = Table::try_new(columns).map_err(|_| ShatterError::Internal)?;
+    aggregate(&table, group, value, AggFunc::Sum)
+}
+
+/// Every row of a strata result as text, in table order. A NULL cell reads as `NULL`.
+pub fn table_rows(table: &Table) -> Result<Vec<Vec<String>>, ShatterError> {
+    let mut rows = Vec::new();
+    for batch in table.batches() {
+        for row in 0..batch.row_count() {
+            let mut cells = Vec::with_capacity(batch.num_columns());
+            for column in &batch.columns {
+                let scalar = column.get(row).ok_or(ShatterError::Internal)?;
+                cells.push(scalar.to_string());
+            }
+            rows.push(cells);
+        }
+    }
+    Ok(rows)
 }
 
 fn now_secs() -> u64 {

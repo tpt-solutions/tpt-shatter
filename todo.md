@@ -100,7 +100,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] TTL enforcement (default 60s) with bounded clock-skew tolerance
 - [x] Bind token to ShardKey and action scopes
 - [x] Signing key versioning + instant rotation (invalidate all active tokens)
-- [x] Token issuer service/endpoint (called by host app after upstream auth) — built in `tpt-shatter-node` (`POST /v1/tokens`): bearer secrets stored as SHA-256, scope and TTL policy per caller, delete never issuable, issuance audited to a keyed chain before release (tested, and smoke-tested end to end over HTTP). Gaps: no caller field in audit events; caller auth is secrets only unless client_ca is set
+- [x] Token issuer service/endpoint (called by host app after upstream auth) — built in `tpt-shatter-node` (`POST /v1/tokens`): bearer secrets stored as SHA-256, scope and TTL policy per caller, delete never issuable, issuance audited to a keyed chain before release (tested, and smoke-tested end to end over HTTP). Gaps: caller auth is secrets only unless client_ca is set. Caller identity is recorded (token v2, keyed digest in the chain). Duplicate caller names are refused at startup (tested)
 - [x] Replay-resistance decision implemented (e.g. nonce/short TTL only) and documented
 - [x] Unit tests: expiry, tamper, wrong scope, wrong shard, wrong key, rotated key
 - [ ] Fuzz tests for token parser (partial: proptest stand-in in place; real cargo-fuzz targets still pending)
@@ -121,11 +121,11 @@ Resolve these before the implementation phases that depend on them.
 - [ ] `FileVault` gaps — PARTIAL: no replication, no backups, overwrite erasure not guaranteed on SSD/CoW volumes (key destruction not wired), no key delivery
 - [x] Node process `tpt-shatter-node` (new crate): JSON config with unknown fields rejected, keys from the environment, TLS required by default, one router with the canary observer, gateway over the assembler, reaper and canary-monitor threads (tested: record round trip, canary read rotates the token key; smoke-tested over HTTP)
 - [x] Ingestion write path — `PUT /v1/records/{shard}` with a `Write`-scoped token: `Writer` in the gateway (rate limit, scope check, uniform errors, never echoes the record), a 64 KiB body limit, unknown fields refused as 400, and one shared orphan store so reaper and ingestion agree (tested at unit, HTTP, and node level)
-- [ ] Node gaps — PARTIAL: keys from environment (no secret store), no container image or supervisor, one node per vault directory (no lock); the write path was tested in-process, not with a live HTTP write from a token minted outside the node
+- [ ] Node gaps — PARTIAL: keys from `TPT_KEYS_DIR` (tmpfs, mode-checked) or environment (development), KEK tool built but not audited, and no tmpfs check; remote vault mode is tested, but its per-request TLS handshake is not measured; no container image or supervisor; one node per vault directory (no lock); the write path was tested in-process, not with a live HTTP write from a token minted outside the node
 - [ ] `vaults/vault-frag-a` config: FileVault directory and sealing key (identity) — PARTIAL: `FileVault` built; per-vault config and key delivery pending
 - [ ] `vaults/vault-frag-b` config: FileVault directory and sealing key (demographic) — PARTIAL: as above
 - [ ] `vaults/vault-frag-c` config: FileVault directory and sealing key (financial/sensitive) — PARTIAL: as above
-- [ ] Per-vault credentials and separate secrets; no shared creds — PARTIAL: each vault has its own sealing key by construction; key delivery pending
+- [ ] Per-vault credentials and separate secrets; no shared creds — PARTIAL: each vault can run as its own service with its own key file, over mTLS (`tpt-shatter-vault-service`, tested on loopback, and a node round trip through three services). The node holds no vault key in that mode. Not deployed; OpenBao unwrap not built (DECISIONS.md, second round)
 - [ ] Storage config: one volume per vault, no replication between vaults — PARTIAL: one directory per vault in `FileVault`; volume layout not built
 - [ ] Per-vault automated backup config
 - [x] Docs + license headers
@@ -156,7 +156,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Zero all memory on completion and on every error path — PARTIAL: buffers are Zeroizing; memory-level verification pending
 - [ ] `mlock` / `mlockall` usage with CAP_IPC_LOCK; fail closed if unavailable — PARTIAL: pending; needs Linux host
 - [ ] Disable core dumps (`RLIMIT_CORE=0`, `PR_SET_DUMPABLE`) — PARTIAL: pending; needs Linux host
-- [ ] Per-request timeout; abort cleanly and zero on cancellation — PARTIAL: `assemble_with_deadline` returns `VaultUnavailable` at the deadline and drops late bodies. A vault call still running is not cancelled, and it finishes in the background; the timeout is not yet wired into the node read path
+- [ ] Per-request timeout; abort cleanly and zero on cancellation — PARTIAL: the node read path uses `assemble_with_deadline` with a 3 s `READ_DEADLINE`, shorter than the 5 s HTTP timeout, so a stalled read returns `503` and frees its blocking thread. A vault call still running is not cancelled; it finishes in the background and its late body is dropped
 - [x] Handle missing/partial fragments safely (no partial record returned)
 - [ ] Internal gRPC (tonic) interface for the gateway, with mTLS — PARTIAL: pending: needs tonic and mTLS
 - [ ] Statically linked build (musl) with no shell — PARTIAL: pending; needs musl toolchain
@@ -174,7 +174,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] `insight-vault/` setup: strata storage layout and schema for anonymized events — PARTIAL: the feed writes `state_dir/analytics.jsonl` (timestamped, policy-approved fields only). `insight-vault/` is still an empty directory and is not used; deciding whether it should hold that file is part of deployment (Phase 12)
 - [x] Decide embedded vs sidecar deployment for strata (embedded, DECISIONS.md)
 - [x] Decide on tpt-strata-parquet bridge: dropped (Apache-only deps; banned in deny.toml)
-- [ ] Sample aggregation queries (sum, group by) for BI access — PARTIAL: `StrataSink::count_by` and `sum_by` exist; no BI-facing access path yet (next item)
+- [x] Sample aggregation queries (sum, group by) for BI access — `tpt-shatter-node export-analytics` writes count or sum CSV per group, within the retention window, suppressing groups under k, with formula-injection guarding. Reads the log only, so it is safe while the node runs (tested, and smoke-tested through the binary). Scheduled exports (`analytics.exports`) rewrite CSV files in `export_dir` on an interval, atomically (tested). Delivery to a BI tool is not built (see DECISIONS.md, BI access)
 - [ ] Analytics subnet access path for BI tools (emitter-only inbound)
 - [x] Tests: no raw PII present in strata output — the log and both strata views (count and sum) are checked for raw name, card, and SSN values, and the bucketed year must appear (`the_log_and_the_strata_views_hold_no_raw_identifiers`)
 - [x] Docs + license headers
@@ -191,7 +191,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Key rotation signal receiver (from canary) with instant effect
 - [x] Health/readiness endpoints — `/healthz` and `/readyz` in `http.rs`, tested
 - [x] TLS termination config — `serve_tls` (TLS 1.3, optional mTLS) built on rustls 0.23 + rustls-graviola 0.2.1, tested with real handshakes (`tests/tls.rs`); cert issuance and rotation pending
-- [ ] Verify the gateway has no network path to any vault — PARTIAL: gateway has no vault-client dependency; network isolation is infrastructure work
+- [ ] Verify the gateway has no network path to any vault — PARTIAL: gateway has no direct vault-client dependency, but it reaches vault-client transitively through `tpt-shatter-canary` (`cargo tree -p tpt-shatter-gateway -i tpt-shatter-vault-client`). Code-level separation needs the canary dependency removed or split; network isolation is infrastructure work
 - [ ] Request size limits, timeouts, header hardening — PARTIAL: request-head size limit and per-request timeout done in `http.rs` (tested); body limits not needed for GET; no-store and nosniff headers set
 - [x] Docs + license headers
 
@@ -222,8 +222,8 @@ Resolve these before the implementation phases that depend on them.
 
 ### Audit trail
 - [x] Define audit event schema (who/what/when via token hash and shard hash, no payload)
-- [ ] Implement tamper-evident audit log (hash chain) — PARTIAL: keyed HMAC chain in common; durable, verified-on-open log (`AuditStore`, node) records issue, ingest, read, and alarm events. Gateway and writer record each authorized operation before it runs, and fail closed if the append fails (tested). Alarms record the vault only, with zero digests. Erasure is not written: `shredder::erase` has no node entry point yet, so there is nothing to hook
-- [ ] Compliance export/report tooling — PARTIAL: `audit::report` and `AuditReport::to_json` summarize a verified chain (counts, bounds, head MAC, no digests); no CLI or scheduled export
+- [ ] Implement tamper-evident audit log (hash chain) — PARTIAL: keyed HMAC chain in common; durable, verified-on-open log (`AuditStore`, node) records issue, ingest, read, and alarm events. Gateway and writer record each authorized operation before it runs, and fail closed if the append fails (tested). Alarms record the vault only, with zero digests. Erasure is recorded: `Node::erase_subject` writes an erasure event (shard digest only) before it deletes, and fails closed if the record cannot be written (tested). It has no HTTP or CLI entry point, by design, so erasure stays an operator-side call
+- [ ] Compliance export/report tooling — PARTIAL: `audit::report` and `AuditReport::to_json` summarize a verified chain (counts, bounds, head MAC, no digests); `tpt-shatter-node export-audit <config.json>` prints the summary (tested). Scheduled export not built
 
 ### Disaster recovery
 - [ ] Backup/restore runbook per vault
@@ -235,16 +235,16 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Re-shatter migration tool (read via assembler, write via shredder, verify, retire old) — PARTIAL: `migrate_shard` (assembler crate) reads each fragment under its own version, writes without the shredder's compensating delete, verifies through the assembler, and resumes after a failed write. Old fragments are retired by overwrite. No batch driver or CLI; field moves are supported, field removal is refused
 
 ### Key provisioning
-- [ ] Bootstrap mechanism for HMAC / derivation keys (RAM-only delivery)
+- [ ] Bootstrap mechanism for HMAC / derivation keys (RAM-only delivery) — PARTIAL: `tpt-shatter-kek` seals the keys under a KEK and unseals them into `TPT_KEYS_DIR` at boot, needing two custodians. Not audited; no check that the target is a tmpfs. Earlier note: the node reads keys from `TPT_KEYS_DIR`, a tmpfs directory that refuses group- or other-readable files (tested on Unix). The KMS unwrap that fills it is not built (DECISIONS.md, end)
 - [ ] Rotation procedure and tooling
-- [ ] Key custody split so no single person holds everything
+- [ ] Key custody split so no single person holds everything — PARTIAL: 2-of-3 Shamir over the KEK, built in `tpt-shatter-kek` (`blahaj`, MIT). It covers every node key, not only the derivation and audit keys. Not audited
 
 ### Observability
-- [ ] Structured JSON logging (`tracing`), with redaction types so sensitive values cannot be logged
-- [ ] Metrics: latency, vault connection status, error codes
-- [ ] OTLP/OpenTelemetry export using MIT-compatible crates (replace Apache-only crates)
+- [x] Structured JSON logging (`tracing`), with redaction types so sensitive values cannot be logged — the node binary logs one JSON object per line to stderr via `init_logging`; all log calls are `tracing` events with counts, codes, and hashes. Redaction: the core types (`ShardKey`, `FragmentId`, `Record`, `CapabilityToken`, `FragmentPayload`) print `Debug` without their values
+- [x] Metrics: latency, vault connection status, error codes — Prometheus text at `/metrics` on the optional `metrics_listen` listener (`metrics.rs`, tested over real HTTP). Counts requests by status and gateway code, canary alarms, analytics emitted, fragments purged, a read-assembly latency histogram, and per-vault breaker state and failures read at scrape time. Labels are fixed vocabulary only. Put the listener on the management network. Not built: an OTLP exporter (see DECISIONS.md)
+- [x] OTLP/OpenTelemetry export — decided: an OpenTelemetry Collector beside each node reads stdout logs and scrapes `/metrics` (DECISIONS.md). Deployment of the Collector is Phase 12 work. In-process exporter deferred unless a deployment cannot run a sidecar
 - [ ] Grafana dashboards and alerts
-- [ ] Lint/test that blocks logging of payloads, fragments, FragmentIds, user identifiers
+- [ ] Lint/test that blocks logging of payloads, fragments, FragmentIds, user identifiers — PARTIAL: a test (`logs_and_alerts_never_contain_values_tokens_or_shard_keys`) runs the access-log lines and alert log through the same JSON subscriber the binary installs and checks for values, tokens, and shard keys. It covers the lines the HTTP layer passes to the sink, not every log call, and there is no static lint yet
 
 ---
 
@@ -273,22 +273,22 @@ Resolve these before the implementation phases that depend on them.
 ---
 
 ## Phase 13 — Testing
-- [ ] Unit tests for all 9 crates using synthetic data — PARTIAL: gateway has no implementation or tests yet
+- [ ] Unit tests for all 9 crates using synthetic data — PARTIAL: every workspace crate has tests now (274 pass); per-crate coverage has not been audited
 - [x] Integration: full pipeline (shred -> vaults -> assemble -> emit -> strata)
 - [x] Integration: fragments land in the correct vault only
 - [x] Integration: assembler reconstructs record exactly
 - [ ] Integration: emitter writes to tpt-strata and output is anonymized — PARTIAL: checked against MemorySink; strata pending
 - [x] Canary tests: inject, query, alarm fires, tokens revoked (alarm path and revocation are tested separately, not in one end-to-end test)
 - [ ] Memory-safety tests: zeroize called; custom allocator asserts memory zeroed after drop — PARTIAL: `Record` is `ZeroizeOnDrop` (compile-time test); allocator-level check pending (needs unsafe, out of policy)
-- [ ] Chaos: kill assembler mid-request, no partial data persists
+- [x] Chaos: kill assembler mid-request, no partial data persists — simulated: a read abandoned at its deadline returns no record, removes no fragment, and a later read succeeds (`an_abandoned_read_leaves_no_partial_state_and_a_later_read_succeeds`). Not a process kill
 - [x] Chaos: kill one vault, graceful degradation
 - [x] Chaos: partial shred write, saga compensates
-- [ ] Pen test: cross-vault query attempts
-- [ ] Pen test: token replay, tamper, expiry
+- [x] Pen test: cross-vault query attempts — a vault B fragment copied over a vault A file reads nothing (`a_fragment_copied_into_another_vault_reads_nothing`, node level). Attacks through the query API are not separately tested; the router has no cross-vault path to test
+- [x] Pen test: token replay, tamper, expiry — node-level tests through `Gateway::read`, not HTTP. Replay is accepted within the TTL and refused after it, by decision (DECISIONS.md); tampered signatures and shard-swapped tokens read nothing
 - [ ] Pen test: extract data from assembler disk image (expect nothing)
 - [ ] Fuzzing for token parser and gRPC inputs
 - [x] Log-scan test: no sensitive values in logs — `logs_and_alerts_never_contain_values_tokens_or_shard_keys` (node) checks every access-log line for reads and writes, successful and refused, plus the alert log after an alarm. Scope: the log lines as generated, not a live HTTP capture or stderr output
-- [ ] Load/latency benchmarks for read path
+- [ ] Load/latency benchmarks for read path — PARTIAL: in-process latency measurement (`read_path_latency`, ignored by default; p50 about 0.4 ms on file vaults). No load test, no concurrency, no HTTP path
 - [x] CI runs all non-infrastructure tests
 
 ---
@@ -297,8 +297,8 @@ Resolve these before the implementation phases that depend on them.
 - [x] README (overview, quick start, license)
 - [ ] Update `DESIGN.md` with resolved gaps and final decisions — PARTIAL: section 12 (stack) updated, section 12a summarizes decisions and threat-model addenda; section 10 gap table not yet marked resolved
 - [ ] Operations runbook (deploy, rotate keys, canary alarm response, DR) — PARTIAL: draft in `docs/RUNBOOK.md` grounded in the real APIs; deploy, key delivery, notification, and DR steps are marked GAP until built
-- [ ] Compliance mapping notes: GDPR, PCI-DSS, HIPAA, SOC 2
-- [ ] Security review of assembler and token crates
-- [ ] Final dependency license audit (`cargo deny check`) and attribution notices — PARTIAL: `cargo deny check` passes on the current tree; attribution (NOTICE) for third-party crates not yet generated
+- [x] Compliance mapping notes: GDPR, PCI-DSS, HIPAA, SOC 2 — `docs/COMPLIANCE.md` maps each control to its status and lists the open gaps. Not legal advice; the spec's section 11 overstated several claims, which the file corrects
+- [ ] Security review of assembler and token crates — PARTIAL: one review pass done (docs/SECURITY_REVIEW.md). Fixed the stalled-vault thread growth with a per-vault in-flight cap. Open low-severity items are listed there. Not an independent audit, and fuzzing is pending
+- [ ] Final dependency license audit (`cargo deny check`) and attribution notices — PARTIAL: `cargo deny check` passes on the current tree; `docs/THIRD_PARTY_NOTICES.md` lists the license of every linked crate (generated from cargo metadata). License texts and Apache-2.0 NOTICE files are not yet bundled; that step is manual
 - [x] Versioning/changelog (`CHANGELOG.md`)
-- [ ] Release checklist and tagged `v1.0.0`
+- [ ] Release checklist and tagged `v1.0.0` — PARTIAL: checklist in `docs/RELEASE.md`. Tag not created; that is the release owner's call

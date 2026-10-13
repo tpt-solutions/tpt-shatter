@@ -13,7 +13,7 @@
 
 mod strata;
 
-pub use strata::StrataSink;
+pub use strata::{Stamped, StrataSink, count_by_events, read_log, sum_by_events, table_rows};
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -60,6 +60,12 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// The k-anonymity threshold: the smallest cohort a batch may contain.
+    #[must_use]
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
     /// Builds a policy.
     ///
     /// Returns [`ShatterError::InvalidParameter`] if the salt is empty, `k` is zero, a

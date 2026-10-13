@@ -27,14 +27,15 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tpt_shatter_common::{
-    CapabilityToken, DEFAULT_TOKEN_TTL_SECS, SHARD_KEY_LEN, Scope, Scopes, ShardKey, ShatterError,
+    CALLER_TAG_LEN, CapabilityToken, DEFAULT_TOKEN_TTL_SECS, SHARD_KEY_LEN, Scope, Scopes,
+    ShardKey, ShatterError,
 };
 use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Token format version written into every token.
-pub const TOKEN_VERSION: u8 = 1;
+pub const TOKEN_VERSION: u8 = 2;
 
 /// Longest permitted token lifetime, in seconds.
 pub const MAX_TTL_SECS: u64 = 300;
@@ -45,8 +46,17 @@ pub const CLOCK_SKEW_SECS: u64 = 5;
 const ID_LEN: usize = 32;
 const KEY_LEN: usize = 32;
 const TAG_LEN: usize = 32;
-// version | key_version | id | scopes | issued_at | expires_at | shard_key
-const PAYLOAD_LEN: usize = 1 + 4 + ID_LEN + 4 + 8 + 8 + SHARD_KEY_LEN;
+// version | key_version | id | scopes | issued_at | expires_at | caller | shard_key
+const OFF_ID: usize = 5;
+const OFF_SCOPES: usize = OFF_ID + ID_LEN;
+const OFF_ISSUED: usize = OFF_SCOPES + 4;
+const OFF_EXPIRES: usize = OFF_ISSUED + 8;
+const OFF_CALLER: usize = OFF_EXPIRES + 8;
+const OFF_SHARD: usize = OFF_CALLER + CALLER_TAG_LEN;
+const PAYLOAD_LEN: usize = OFF_SHARD + SHARD_KEY_LEN;
+
+/// Caller tag for a token issued without one. The node always issues with a caller.
+pub const UNATTRIBUTED: [u8; CALLER_TAG_LEN] = [0; CALLER_TAG_LEN];
 const TOKEN_LEN: usize = PAYLOAD_LEN + TAG_LEN;
 
 /// Issues and verifies capability tokens under one signing key.
@@ -90,9 +100,22 @@ impl Signer {
         self.issue_with_ttl(shard_key, scopes, now, DEFAULT_TOKEN_TTL_SECS)
     }
 
-    /// Issues a token with an explicit TTL in `1..=MAX_TTL_SECS`.
+    /// Issues a token with an explicit TTL in `1..=MAX_TTL_SECS`, with no caller tag.
     pub fn issue_with_ttl(
         &self,
+        shard_key: &ShardKey,
+        scopes: Scopes,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Zeroizing<String>, ShatterError> {
+        self.issue_for(&UNATTRIBUTED, shard_key, scopes, now, ttl_secs)
+    }
+
+    /// Issues a token tagged with `caller`, with an explicit TTL in `1..=MAX_TTL_SECS`.
+    /// The tag is covered by the signature, so the gateway can attribute each use.
+    pub fn issue_for(
+        &self,
+        caller: &[u8; CALLER_TAG_LEN],
         shard_key: &ShardKey,
         scopes: Scopes,
         now: u64,
@@ -108,6 +131,7 @@ impl Signer {
         payload.extend_from_slice(&scopes.bits().to_be_bytes());
         payload.extend_from_slice(&now.to_be_bytes());
         payload.extend_from_slice(&now.saturating_add(ttl_secs).to_be_bytes());
+        payload.extend_from_slice(caller);
         payload.extend_from_slice(shard_key.as_bytes());
         let tag = self.tag(&payload)?;
         payload.extend_from_slice(&tag);
@@ -140,11 +164,12 @@ impl Signer {
             .map_err(|_| ShatterError::InvalidToken)?;
 
         // The tag is authentic, so the fields below are trusted. Still validate them.
-        let id = to_array::<ID_LEN>(&payload[5..5 + ID_LEN]);
-        let scopes = Scopes::from_bits(read_u32(&payload[5 + ID_LEN..9 + ID_LEN]));
-        let issued_at = read_u64(&payload[9 + ID_LEN..17 + ID_LEN]);
-        let expires_at = read_u64(&payload[17 + ID_LEN..25 + ID_LEN]);
-        let shard = to_array::<SHARD_KEY_LEN>(&payload[25 + ID_LEN..]);
+        let id = to_array::<ID_LEN>(&payload[OFF_ID..OFF_SCOPES]);
+        let scopes = Scopes::from_bits(read_u32(&payload[OFF_SCOPES..OFF_ISSUED]));
+        let issued_at = read_u64(&payload[OFF_ISSUED..OFF_EXPIRES]);
+        let expires_at = read_u64(&payload[OFF_EXPIRES..OFF_CALLER]);
+        let caller = to_array::<CALLER_TAG_LEN>(&payload[OFF_CALLER..OFF_SHARD]);
+        let shard = to_array::<SHARD_KEY_LEN>(&payload[OFF_SHARD..]);
 
         let lifetime = expires_at
             .checked_sub(issued_at)
@@ -161,6 +186,7 @@ impl Signer {
             scopes,
             issued_at,
             lifetime,
+            caller,
             ShardKey::from_bytes(shard),
         ))
     }
@@ -253,6 +279,41 @@ mod tests {
 
     fn read_scope() -> Scopes {
         Scopes::from_scopes(&[Scope::Read])
+    }
+
+    #[test]
+    fn the_caller_tag_round_trips_and_is_covered_by_the_signature() {
+        let s = signer();
+        let caller = [0xC4; CALLER_TAG_LEN];
+        let tok = s
+            .issue_for(
+                &caller,
+                &shard(7),
+                read_scope(),
+                NOW,
+                DEFAULT_TOKEN_TTL_SECS,
+            )
+            .expect("issue");
+        let claims = s.verify(&tok, NOW + 1).expect("verify");
+        assert_eq!(claims.caller(), &caller);
+        assert_eq!(claims.shard_key().as_bytes(), &[7; SHARD_KEY_LEN]);
+
+        // Change one byte of the tag, then re-encode the token: the tag no longer verifies.
+        let mut raw = BASE64_URL_SAFE_NO_PAD.decode(&tok).expect("decode");
+        raw[OFF_CALLER] ^= 0x01;
+        let forged = BASE64_URL_SAFE_NO_PAD.encode(&raw);
+        assert_eq!(
+            s.verify(&forged, NOW + 1).err(),
+            Some(ShatterError::InvalidToken)
+        );
+    }
+
+    #[test]
+    fn tokens_issued_without_a_caller_carry_the_unattributed_tag() {
+        let s = signer();
+        let tok = s.issue(&shard(7), read_scope(), NOW).expect("issue");
+        let claims = s.verify(&tok, NOW + 1).expect("verify");
+        assert_eq!(claims.caller(), &UNATTRIBUTED);
     }
 
     #[test]

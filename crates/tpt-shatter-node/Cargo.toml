@@ -28,6 +28,8 @@ rand = "0.10.3"
 sha2 = "0.11.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "macros", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tpt-shatter-assembler = { version = "0.1.0", path = "../tpt-shatter-assembler" }
@@ -36,5 +38,6 @@ tpt-shatter-emitter = { version = "0.1.0", path = "../tpt-shatter-emitter" }
 tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
 tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
 tpt-shatter-shredder = { version = "0.1.0", path = "../tpt-shatter-shredder" }
+tpt-shatter-vault-service = { version = "0.1.0", path = "../tpt-shatter-vault-service" }
 tpt-shatter-token = { version = "0.1.0", path = "../tpt-shatter-token" }
 tpt-shatter-vault-client = { version = "0.1.0", path = "../tpt-shatter-vault-client" }

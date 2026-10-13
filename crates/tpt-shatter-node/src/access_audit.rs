@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tpt_shatter_canary::Alarm;
 use tpt_shatter_common::{
-    AUDIT_DIGEST_LEN, AuditAction, AuditEvent, Scope, ShardKey, ShatterError,
+    AUDIT_DIGEST_LEN, AuditAction, AuditEvent, CALLER_TAG_LEN, Scope, ShardKey, ShatterError,
 };
 use tpt_shatter_gateway::AccessAudit;
 use tpt_shatter_vault_client::keyed_digest;
@@ -38,6 +38,7 @@ impl AccessAudit for NodeAudit {
         &self,
         scope: Scope,
         token: &str,
+        caller: &[u8; CALLER_TAG_LEN],
         shard: &ShardKey,
         now: u64,
     ) -> Result<(), ShatterError> {
@@ -58,10 +59,22 @@ impl AccessAudit for NodeAudit {
             action,
             token_digest: keyed_digest(self.store.key(), token_domain, token.as_bytes())?,
             shard_digest: keyed_digest(self.store.key(), shard_domain, shard.as_bytes())?,
+            caller: caller_digest(self.store.key(), caller)?,
             vault: None,
             at: now,
         })
     }
+}
+
+/// The audit digest of a caller tag. A token issued without a caller (all zeros) has none.
+fn caller_digest(
+    key: &[u8; 32],
+    caller: &[u8; CALLER_TAG_LEN],
+) -> Result<Option<[u8; AUDIT_DIGEST_LEN]>, ShatterError> {
+    if caller == &[0; CALLER_TAG_LEN] {
+        return Ok(None);
+    }
+    keyed_digest(key, b"tpt-shatter/caller", caller).map(Some)
 }
 
 /// Records one canary alarm. Only the vault is kept, as in the alert log.
@@ -70,7 +83,21 @@ pub fn record_alarm(store: &AuditStore, alarm: &Alarm, at: u64) -> Result<(), Sh
         action: AuditAction::Alarm,
         token_digest: NO_DIGEST,
         shard_digest: NO_DIGEST,
+        caller: None,
         vault: Some(alarm.vault),
+        at,
+    })
+}
+
+/// Records an erasure request for `shard` before its fragments are deleted. Only the shard
+/// digest is kept. Erasure is maintenance, so no token authorizes it.
+pub fn record_erasure(store: &AuditStore, shard: &ShardKey, at: u64) -> Result<(), ShatterError> {
+    store.record(AuditEvent {
+        action: AuditAction::Erasure,
+        token_digest: NO_DIGEST,
+        shard_digest: keyed_digest(store.key(), b"tpt-shatter/erasure/shard", shard.as_bytes())?,
+        caller: None,
+        vault: None,
         at,
     })
 }

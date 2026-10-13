@@ -109,7 +109,7 @@ impl<S: RecordSink> Writer<S> {
 
         let shard = ShardKey::from_hex(shard_hex)?;
         let signer = self.signer.read().map_err(|_| ShatterError::Internal)?;
-        signer.authorize(token, &shard, Scope::Write, now_ms / 1000)?;
+        let claims = signer.authorize(token, &shard, Scope::Write, now_ms / 1000)?;
         drop(signer);
 
         let mut record = Record::new();
@@ -119,7 +119,7 @@ impl<S: RecordSink> Writer<S> {
             }
         }
         if let Some(audit) = &self.audit {
-            audit.authorized(Scope::Write, token, &shard, now_ms / 1000)?;
+            audit.authorized(Scope::Write, token, claims.caller(), &shard, now_ms / 1000)?;
         }
         self.sink.store(&shard, record)
     }

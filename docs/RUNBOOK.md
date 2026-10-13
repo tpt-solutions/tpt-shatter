@@ -9,15 +9,48 @@ automated. Review this runbook before any deployment.
 
 - Run `tpt-shatter-node <config.json>`. The config is JSON with `deny_unknown_fields`:
   `listen`, `tls_cert`, `tls_key`, optional `client_ca` (turns on mTLS), `schema`,
-  `state_dir`, `vault_dirs` (`a`, `b`, `c`), `canary_count`, `canary_period_secs`,
+  `state_dir`, `vault_dirs` (`a`, `b`, `c`) or `remote_vaults` (see below), `canary_count`,
+  `canary_period_secs`,
   `alarm_cooldown_secs`, `reap_interval_secs`, `reap_max_attempts`,
   `monitor_interval_secs`, `retention_secs` (maximum fragment age; at least
   `canary_period_secs`), `purge_interval_secs`. `allow_plain_http` is for development only, and TLS is required
   by default. The binary refuses to start without TLS settings.
-- Keys come from the environment, as 64 hex characters each: `TPT_KEY_VAULT_A`,
+- Vaults can run as separate services. Each vault runs `tpt-shatter-vault <config.json>` on
+  its own host, with its own key file and directory, and requires node client certificates
+  that chain to its `client_ca`. The node then sets `remote_vaults` (`a`, `b`, `c` as
+  `host:port`, `server_name`, `ca`, `client_cert`, `client_key`) in place of `vault_dirs`, and
+  holds no vault keys. Each vault service runs its own retention purge (`retention_secs`,
+  `purge_interval_secs`). The protocol is in `crates/tpt-shatter-vault-service/README.md`.
+  **GAP:** the services are not deployed by any Terraform or Kubernetes config yet.
+- Production: set `TPT_KEYS_DIR` to a directory on a tmpfs holding one file per key, named
+  as below, each with 64 hex characters and mode 0400. The node refuses a key file that is
+  readable or writable by group or others. The boot step writes the directory from the
+  sealed key material, through the custody ceremony in the next section.
+- Key custody ceremony (`tpt-shatter-kek`, see its README). Run it on a trusted machine,
+  not on a node.
+  1. `generate <dir> <names...>` writes fresh keys, or `<dir>` already holds the keys to
+     protect.
+  2. `seal <dir> <blob>` writes the blob and prints three custodian shares. Give each share
+     to a different custodian, in a sealed envelope, and record which custodian holds which
+     share. Shares must not be photographed, emailed, or stored with the blob.
+  3. Delete `<dir>` with a secure overwrite. The blob may be stored with the node.
+  4. Boot: on the node, run `unseal <blob> /run/tpt-keys` with two shares on stdin, then start
+     the node with `TPT_KEYS_DIR=/run/tpt-keys`. `/run` must be a tmpfs. Two custodians must
+     be present for every boot.
+  5. To change a key, repeat from step 1 with the new key, then re-seal. Re-keying the
+     derivation key is a re-shatter, not a rotation (see DECISIONS.md).
+  **GAP:** no tool checks that `/run` is a tmpfs, and the shares are typed at a terminal.
+- Cloud custody, instead of shares: `seal <dir> <blob> --kms-wrap <program>`, and at boot
+  `unseal <blob> /run/tpt-keys --kms-unwrap <program>`. The program is an operator-written
+  wrapper: it reads hex on stdin, calls the cloud KMS to encrypt or decrypt, and prints hex on
+  stdout. Cloud CLIs usually emit base64, so the wrapper converts. The path to the program is
+  fixed in the boot unit file, not read from the blob. Boot then needs no custodians, only the
+  cloud identity the wrapper runs as, so restrict that identity to the one KMS key.
+  **Not tested against a live cloud KMS.**
+- Development only: keys come from the environment, as 64 hex characters each: `TPT_KEY_VAULT_A`,
   `TPT_KEY_VAULT_B`, `TPT_KEY_VAULT_C`, `TPT_KEY_DERIVATION`, `TPT_KEY_TOKEN`,
   `TPT_KEY_CANARY_MASTER`, `TPT_KEY_AUDIT`, `TPT_KEY_ANALYTICS`. The binary names the variable that failed and never prints a
-  value. **GAP:** environment keys are an interim source; a secret store is not wired.
+  value. The key directory is filled by `tpt-shatter-kek unseal`, which is manual.
 - On start, the node writes the current epoch's canaries into the vaults and records the
   epoch in `state_dir/canary_epoch`. Each monitor pass refreshes canaries when the epoch
   changes, runs the canary response, and writes alarms to `state_dir/alerts.jsonl`.
@@ -40,8 +73,11 @@ automated. Review this runbook before any deployment.
   `TPT_KEY_AUDIT`. The node refuses to start if the log does not verify under that key, so
   keep the key and the log together. The log holds digests and times, not tokens, secrets,
   or field values.
-- **GAP:** the audit event does not record which caller asked. The access log does. Recording
-  the caller in the chain needs a field in the event format.
+- To export a compliance summary, run `tpt-shatter-node export-audit <config.json>`. It
+  verifies the chain first and prints counts by action and vault, the time range, and the
+  head MAC, with no digests. See [COMPLIANCE.md](COMPLIANCE.md).
+- The audit event records the caller as a keyed digest of the caller tag, which the token
+  carries (token version 2). Version 1 tokens are refused.
 - The issuer listener uses the node's TLS acceptor. When `client_ca` is set, it requires
   client certificates too, so mTLS applies to both listeners. Without `client_ca`, caller
   secrets are the only caller authentication. Either way, keep the issuer address on an
@@ -143,3 +179,36 @@ When the canary detects a canary FragmentId being read through the vault router:
 - Keep the audit chain's head hash on a volume other than the vault volumes, so a vault
   compromise cannot rewrite both. **GAP:** anchoring is not implemented yet.
 - Keep `cargo deny` output and test output for each release.
+
+## Analytics export (BI)
+
+- `tpt-shatter-node export-analytics <config.json> <group> [value]` writes a CSV to stdout:
+  a count of each `group` value, or the sum of `value` per group when `value` is given.
+- It reads `state_dir/analytics.jsonl` only. It never writes the log, so it is safe while the
+  node runs.
+- Only events inside `retention_secs` count. Groups with fewer than the policy's `k` events
+  are left out, because a small cohort could identify the people in it.
+- A field that starts with `=`, `+`, `-`, or `@` is prefixed with `'` so a spreadsheet reads
+  it as text.
+- Sums are noisy by design, since the `balance`-style fields pass through the policy's noise
+  transform. Treat them as estimates.
+- **Scheduled exports.** Set `analytics.export_dir` and `analytics.exports` in the node config, for
+  example `{"group": "birth_year", "file": "by_decade.csv"}` or `{"group": "birth_year", "value":
+  "balance", "file": "balance_by_decade.csv"}`. The node rewrites each file every
+  `analytics.export_interval_secs` (default 3600). Files are written beside their name and renamed
+  into place, so a reader never sees a partial file. The BI tool reads files from `export_dir`.
+- **Delivery is not built.** Copying `export_dir` to a BI tool, and the analytics subnet that would
+  carry it, are infrastructure work (Phase 12). Nothing here opens a network path.
+
+## Metrics
+
+- Set `metrics_listen` to an address on the management network, for example `10.0.0.5:9100`.
+  The endpoint is off when the key is absent. It uses the node's TLS settings.
+- `GET /metrics` returns Prometheus text. Other paths get `404`.
+- Series: `tpt_shatter_access_total{status,code}`, `tpt_shatter_canary_alarms_total`,
+  `tpt_shatter_analytics_emitted_total`, `tpt_shatter_fragments_purged_total`,
+  `tpt_shatter_vault_breaker_open{vault}`, `tpt_shatter_vault_consecutive_failures{vault}`, and
+  the `tpt_shatter_assembly_seconds` histogram.
+- OTLP export is handled by an OpenTelemetry Collector beside each node. The Collector scrapes
+  `/metrics` and reads the node's stdout logs. Its configuration is Phase 12 work.
+- **GAP:** no Collector configuration, dashboards, or alert rules are provided yet.

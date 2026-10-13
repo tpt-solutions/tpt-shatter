@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "tpt-shatter-vault-service"
+description = "One vault served over mTLS: a server that holds one vault's sealing key, and a client that the node uses as a VaultBackend."
+readme = "README.md"
+repository.workspace = true
+keywords = ["vault", "mtls", "fragments", "rustls", "isolation"]
+categories = ["network-programming", "cryptography"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+# Nothing in this workspace is published to crates.io.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tpt-shatter-vault"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-graviola = "=0.2.1"
+rustls-pki-types = { version = "1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
+tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
+tpt-shatter-vault-client = { version = "0.1.0", path = "../tpt-shatter-vault-client" }
+zeroize = "1.9.1"

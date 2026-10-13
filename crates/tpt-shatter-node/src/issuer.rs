@@ -40,8 +40,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tpt_shatter_common::{
-    AuditAction, AuditChain, AuditEvent, AuditRecord, DEFAULT_TOKEN_TTL_SECS, Scope, Scopes,
-    ShardKey, ShatterError, verify_chain,
+    AuditAction, AuditChain, AuditEvent, AuditRecord, CALLER_TAG_LEN, DEFAULT_TOKEN_TTL_SECS,
+    Scope, Scopes, ShardKey, ShatterError, verify_chain,
 };
 use tpt_shatter_token::{MAX_TTL_SECS, Signer};
 use tpt_shatter_vault_client::keyed_digest;
@@ -80,6 +80,8 @@ pub struct IssuerConfig {
 struct Caller {
     name: String,
     secret_hash: [u8; 32],
+    /// Tag written into every token this caller is issued; see `caller_tag`.
+    tag: [u8; CALLER_TAG_LEN],
     scopes: Scopes,
     max_ttl: u64,
 }
@@ -193,6 +195,12 @@ impl Issuer {
             .iter()
             .map(parse_caller)
             .collect::<Result<Vec<_>, _>>()?;
+        // Caller tags come from names, so two callers with one name would share attribution.
+        let mut tags: Vec<[u8; CALLER_TAG_LEN]> = callers.iter().map(|c| c.tag).collect();
+        tags.sort_unstable();
+        if tags.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ShatterError::InvalidParameter);
+        }
         Ok(Self {
             signer,
             callers,
@@ -232,13 +240,13 @@ impl Issuer {
         }
 
         let token = match self.signer.read() {
-            Ok(signer) => match signer.issue_with_ttl(&shard, scopes, now, ttl) {
+            Ok(signer) => match signer.issue_for(&caller.tag, &shard, scopes, now, ttl) {
                 Ok(token) => token,
                 Err(_) => return refused(500, "internal", name),
             },
             Err(_) => return refused(500, "internal", name),
         };
-        let event = match self.event(token.as_bytes(), shard.as_bytes(), now) {
+        let event = match self.event(token.as_bytes(), shard.as_bytes(), &caller.tag, now) {
             Ok(event) => event,
             Err(_) => return refused(500, "internal", name),
         };
@@ -266,11 +274,22 @@ impl Issuer {
         matched
     }
 
-    fn event(&self, token: &[u8], shard: &[u8], now: u64) -> Result<AuditEvent, ShatterError> {
+    fn event(
+        &self,
+        token: &[u8],
+        shard: &[u8],
+        caller: &[u8; CALLER_TAG_LEN],
+        now: u64,
+    ) -> Result<AuditEvent, ShatterError> {
         Ok(AuditEvent {
             action: AuditAction::Issue,
             token_digest: keyed_digest(self.audit.key(), b"tpt-shatter/issue/token", token)?,
             shard_digest: keyed_digest(self.audit.key(), b"tpt-shatter/issue/shard", shard)?,
+            caller: Some(keyed_digest(
+                self.audit.key(),
+                b"tpt-shatter/caller",
+                caller,
+            )?),
             vault: None,
             at: now,
         })
@@ -336,6 +355,15 @@ fn scopes_within(requested: Scopes, allowed: Scopes) -> bool {
     requested.bits() & !allowed.bits() == 0
 }
 
+/// The caller tag for `name`: the first 16 bytes of its SHA-256. It is public in the token, so
+/// the audit chain stores only a keyed digest of it.
+fn caller_tag(name: &str) -> [u8; CALLER_TAG_LEN] {
+    let digest = Sha256::digest(name.as_bytes());
+    let mut tag = [0u8; CALLER_TAG_LEN];
+    tag.copy_from_slice(&digest[..CALLER_TAG_LEN]);
+    tag
+}
+
 fn parse_caller(config: &CallerConfig) -> Result<Caller, ShatterError> {
     let secret_hash = parse_hex32(&config.secret_sha256)?;
     if config.max_ttl_secs == 0 || config.max_ttl_secs > MAX_TTL_SECS {
@@ -349,6 +377,7 @@ fn parse_caller(config: &CallerConfig) -> Result<Caller, ShatterError> {
     Ok(Caller {
         name: config.name.clone(),
         secret_hash,
+        tag: caller_tag(&config.name),
         scopes,
         max_ttl: config.max_ttl_secs,
     })
@@ -470,11 +499,11 @@ async fn route_issue(req: Request<Incoming>, issuer: Arc<Issuer>) -> HttpRespons
         }
     };
     // The access log gets the caller name and the status. Never the body, which holds the token.
-    eprintln!(
-        "issuer: status={} code={} caller={}",
-        outcome.status,
-        outcome.code,
-        outcome.caller.as_deref().unwrap_or("-")
+    tracing::info!(
+        status = outcome.status,
+        code = outcome.code,
+        caller = outcome.caller.as_deref().unwrap_or("-"),
+        "token issuer request"
     );
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     json_response(status, &outcome.body)
@@ -529,6 +558,17 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         std::env::temp_dir().join(format!("tpt-shatter-issuer-{name}-{nanos}.jsonl"))
+    }
+
+    #[test]
+    fn two_callers_with_one_name_are_refused() {
+        let path = temp_log("dup-name");
+        let signer = Arc::new(RwLock::new(Signer::new(1, [0x5E; 32])));
+        let audit = Arc::new(AuditStore::open(&path, KEY).expect("audit"));
+        let mut cfg = config();
+        cfg.callers[1].name = "host-app".to_owned();
+        assert!(Issuer::new(signer, &cfg, audit).is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     fn issuer_at(path: &Path) -> Issuer {

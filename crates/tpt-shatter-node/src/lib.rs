@@ -21,18 +21,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use serde::Deserialize;
-use tpt_shatter_assembler::Assembler;
+use tpt_shatter_assembler::assemble_with_deadline;
 use tpt_shatter_canary::{Alarm, CanaryMonitor, CanaryRotation, CanaryWatch, refresh_canaries};
 use tpt_shatter_common::{
-    AlertLog, Record, RetentionPolicy, ShardKey, ShatterError, ShatterSchema, VaultId,
+    AlertLog, AuditRecord, Record, RetentionPolicy, ShardKey, ShatterError, ShatterSchema, VaultId,
+    report,
 };
 use tpt_shatter_gateway::{
     AccessAudit, AlarmResponder, Gateway, HttpConfig, RateLimiter, RecordSink, RecordSource,
     Shared, SigningKeyRotator, WriteHandler, Writer,
 };
-use tpt_shatter_shredder::{OrphanStore, Shredder};
+use tpt_shatter_shredder::{EraseReport, OrphanStore, Shredder, erase};
+use tpt_shatter_vault_service::{RemoteVault, client_tls_from_files};
 
 use access_audit::NodeAudit;
 pub use issuer::{AuditStore, IssueOutcome, Issuer, IssuerConfig, serve_issuer};
@@ -40,7 +43,7 @@ mod access_audit;
 mod analytics;
 mod issuer;
 
-use analytics::{Analytics, load_policy};
+use analytics::{Analytics, ExportPlan, load_policy};
 use tpt_shatter_token::Signer;
 use tpt_shatter_vault_client::{
     AccessObserver, BreakerConfig, BreakerState, FileVault, Guarded, PurgeReport, Router,
@@ -61,6 +64,52 @@ pub struct AnalyticsConfig {
     /// The anonymization policy (JSON). See `analytics.rs` for the format. Its events are kept
     /// for `retention_secs`, the same window as vault fragments.
     pub policy: PathBuf,
+    /// Directory the scheduled exports are written into. Required when `exports` is not empty.
+    #[serde(default)]
+    pub export_dir: Option<PathBuf>,
+    /// CSV exports to write on each export pass. Empty means no scheduled exports.
+    #[serde(default)]
+    pub exports: Vec<ExportConfig>,
+    /// Seconds between export passes. Must be positive.
+    #[serde(default = "default_export_interval_secs")]
+    pub export_interval_secs: u64,
+}
+
+fn default_export_interval_secs() -> u64 {
+    3600
+}
+
+/// One scheduled CSV export. See [`export_analytics`] for what it contains.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportConfig {
+    /// The field to group by.
+    pub group: String,
+    /// The field to sum per group. Absent means count the events per group.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// File name inside `export_dir`. A plain name, not a path.
+    pub file: String,
+}
+
+/// Remote vault services (`tpt-shatter-vault`), one per vault, reached over mTLS.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteVaults {
+    /// `host:port` of vault A's service.
+    pub a: String,
+    /// `host:port` of vault B's service.
+    pub b: String,
+    /// `host:port` of vault C's service.
+    pub c: String,
+    /// Name the services' certificates must carry, for example `vault.internal`.
+    pub server_name: String,
+    /// CA that the services' certificates must chain to (PEM).
+    pub ca: PathBuf,
+    /// This node's client certificate (PEM).
+    pub client_cert: PathBuf,
+    /// This node's client private key (PEM).
+    pub client_key: PathBuf,
 }
 
 /// Where each vault keeps its files.
@@ -94,8 +143,13 @@ pub struct Config {
     pub schema: PathBuf,
     /// Directory for the orphan log, the alert log, and the canary epoch marker.
     pub state_dir: PathBuf,
-    /// The vault directories.
-    pub vault_dirs: VaultDirs,
+    /// The local vault directories. Required unless `remote_vaults` is set.
+    #[serde(default)]
+    pub vault_dirs: Option<VaultDirs>,
+    /// Remote vault services, one per vault. When set, the node uses them in place of
+    /// `vault_dirs` and needs no vault keys.
+    #[serde(default)]
+    pub remote_vaults: Option<RemoteVaults>,
     /// Canaries per epoch. Must be positive.
     pub canary_count: usize,
     /// Epoch length in seconds. Must be positive. A week is typical.
@@ -121,6 +175,29 @@ pub struct Config {
     /// The analytics feed. Absent means accepted writes are not fed to analytics.
     #[serde(default)]
     pub analytics: Option<AnalyticsConfig>,
+    /// Address for the Prometheus `/metrics` endpoint. Absent means no metrics listener.
+    /// Put it on the management network. It uses the same TLS rules as the read path.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
+}
+
+/// Installs the JSON log subscriber on stderr at INFO and above. The binary calls this once
+/// at start. Calling it again, or after another subscriber is set, does nothing.
+pub fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+}
+
+pub use metrics::{Metrics, serve_metrics};
+mod metrics;
+
+/// The access log the binary installs: one structured `request` event per line.
+#[must_use]
+pub fn access_log_sink() -> Arc<dyn Fn(&str) + Send + Sync> {
+    Arc::new(|line: &str| tracing::info!(access = line, "request"))
 }
 
 /// The eight 32-byte keys a node needs. Each is 64 hex characters in the environment.
@@ -128,12 +205,9 @@ pub struct Config {
 /// Keys are read from the environment at boot and held in RAM. Key delivery from a
 /// secret store is not built, so the environment is the interim source.
 pub struct Keys {
-    /// Sealing key for vault A.
-    pub vault_a: [u8; 32],
-    /// Sealing key for vault B.
-    pub vault_b: [u8; 32],
-    /// Sealing key for vault C.
-    pub vault_c: [u8; 32],
+    /// Sealing keys for the three local vaults. `None` when the vault keys are not
+    /// provisioned on this node, which is the case when the node uses remote vault services.
+    pub vaults: Option<VaultKeys>,
     /// FragmentId derivation key. Shared by the shredder and the assembler.
     pub derivation: [u8; 32],
     /// Token signing key, version 1.
@@ -145,6 +219,16 @@ pub struct Keys {
     /// Salt for pseudonyms in the analytics feed. Used even when analytics is off, so a
     /// node always has the same key set.
     pub analytics: [u8; 32],
+}
+
+/// The local vaults' sealing keys. Only a node that stores fragments itself holds these.
+pub struct VaultKeys {
+    /// Sealing key for vault A.
+    pub a: [u8; 32],
+    /// Sealing key for vault B.
+    pub b: [u8; 32],
+    /// Sealing key for vault C.
+    pub c: [u8; 32],
 }
 
 /// Environment variable names for each key.
@@ -160,6 +244,54 @@ pub const KEY_VARS: [&str; 8] = [
 ];
 
 impl Keys {
+    /// Reads every key from a file in `dir`, one file per variable name, named as in
+    /// [`KEY_VARS`]. Each file holds one key as 64 hex characters.
+    ///
+    /// This is the production source: the directory sits on a tmpfs, and the boot step
+    /// writes it from the KMS-wrapped key material. On Unix, a file readable or writable by
+    /// group or others is refused, so a key cannot be loaded from a shared-readable file.
+    /// Errors name the variable, never its contents.
+    pub fn from_dir(dir: &Path) -> Result<Self, ShatterError> {
+        let get = |name: &str| -> Result<[u8; 32], ShatterError> {
+            let path = dir.join(name);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&path)
+                    .map_err(|_| ShatterError::InvalidParameter)?
+                    .permissions()
+                    .mode();
+                if mode & 0o077 != 0 {
+                    return Err(ShatterError::InvalidParameter);
+                }
+            }
+            let text = fs::read_to_string(&path).map_err(|_| ShatterError::InvalidParameter)?;
+            parse_key(&text)
+        };
+        let present = |name: &str| dir.join(name).exists();
+        let vaults = match (
+            present(KEY_VARS[0]),
+            present(KEY_VARS[1]),
+            present(KEY_VARS[2]),
+        ) {
+            (false, false, false) => None,
+            (true, true, true) => Some(VaultKeys {
+                a: get(KEY_VARS[0])?,
+                b: get(KEY_VARS[1])?,
+                c: get(KEY_VARS[2])?,
+            }),
+            _ => return Err(ShatterError::InvalidParameter),
+        };
+        Ok(Self {
+            vaults,
+            derivation: get(KEY_VARS[3])?,
+            token: get(KEY_VARS[4])?,
+            canary_master: get(KEY_VARS[5])?,
+            audit: get(KEY_VARS[6])?,
+            analytics: get(KEY_VARS[7])?,
+        })
+    }
+
     /// Reads every key with `lookup`. Fails if any is missing or not 64 hex characters.
     ///
     /// The error names the variable that failed, never its value.
@@ -168,10 +300,21 @@ impl Keys {
             let value = lookup(name).ok_or(ShatterError::InvalidParameter)?;
             parse_key(&value)
         };
+        let vaults = match (
+            lookup(KEY_VARS[0]),
+            lookup(KEY_VARS[1]),
+            lookup(KEY_VARS[2]),
+        ) {
+            (None, None, None) => None,
+            (Some(a), Some(b), Some(c)) => Some(VaultKeys {
+                a: parse_key(&a)?,
+                b: parse_key(&b)?,
+                c: parse_key(&c)?,
+            }),
+            _ => return Err(ShatterError::InvalidParameter),
+        };
         Ok(Self {
-            vault_a: get(KEY_VARS[0])?,
-            vault_b: get(KEY_VARS[1])?,
-            vault_c: get(KEY_VARS[2])?,
+            vaults,
             derivation: get(KEY_VARS[3])?,
             token: get(KEY_VARS[4])?,
             canary_master: get(KEY_VARS[5])?,
@@ -200,11 +343,26 @@ pub struct Source {
     schema: Arc<ShatterSchema>,
     router: Arc<Router>,
     derivation: [u8; 32],
+    metrics: Arc<Metrics>,
 }
+
+/// How long one read may wait on the vaults. It is shorter than the HTTP request timeout, so a
+/// stalled vault gives a `503` from the assembler, and the blocking thread is freed at this
+/// point rather than when the vault finally answers.
+pub const READ_DEADLINE: Duration = Duration::from_secs(3);
 
 impl RecordSource for Source {
     fn fetch(&self, shard: &ShardKey) -> Result<Record, ShatterError> {
-        Assembler::new(&self.schema, &self.router, self.derivation).assemble(shard)
+        let started = std::time::Instant::now();
+        let record = assemble_with_deadline(
+            &self.schema,
+            &self.router,
+            &self.derivation,
+            shard,
+            READ_DEADLINE,
+        );
+        self.metrics.observe_assembly(started.elapsed());
+        record
     }
 }
 
@@ -229,6 +387,7 @@ pub struct Node {
     /// The same vault instances the router uses, kept for the purge pass.
     vaults: Vec<Arc<FileVault>>,
     retention: RetentionPolicy,
+    metrics: Arc<Metrics>,
 }
 
 /// Stores a shredded record through the node's shredder and its shared orphan store, and
@@ -271,23 +430,45 @@ impl Node {
         let schema = Arc::new(ShatterSchema::load_json_file(&config.schema)?);
         fs::create_dir_all(&config.state_dir).map_err(|_| ShatterError::Internal)?;
 
-        let backends: [(VaultId, &PathBuf, &[u8; 32]); 3] = [
-            (VaultId::A, &config.vault_dirs.a, &keys.vault_a),
-            (VaultId::B, &config.vault_dirs.b, &keys.vault_b),
-            (VaultId::C, &config.vault_dirs.c, &keys.vault_c),
-        ];
         let retention = RetentionPolicy::new(config.retention_secs)?;
         let mut guards = Vec::with_capacity(3);
+        // Local vaults are purged here. Remote vaults purge themselves (see `tpt-shatter-vault`).
         let mut vaults = Vec::with_capacity(3);
-        for (vault, dir, key) in backends {
-            let file_vault = Arc::new(FileVault::open(vault, dir, key)?);
-            let backend: Box<dyn VaultBackend> = Box::new(Arc::clone(&file_vault));
-            vaults.push(file_vault);
-            guards.push(Guarded::new(
-                backend,
-                BreakerConfig::default(),
-                system_clock(),
-            ));
+        if let Some(remote) = &config.remote_vaults {
+            let tls = client_tls_from_files(&remote.ca, &remote.client_cert, &remote.client_key)?;
+            for (vault, addr) in [
+                (VaultId::A, &remote.a),
+                (VaultId::B, &remote.b),
+                (VaultId::C, &remote.c),
+            ] {
+                let backend = RemoteVault::new(vault, addr, &remote.server_name, Arc::clone(&tls))?;
+                guards.push(Guarded::new(
+                    Box::new(backend),
+                    BreakerConfig::default(),
+                    system_clock(),
+                ));
+            }
+        } else {
+            let dirs = config
+                .vault_dirs
+                .as_ref()
+                .ok_or(ShatterError::InvalidParameter)?;
+            let local = keys.vaults.as_ref().ok_or(ShatterError::InvalidParameter)?;
+            let backends: [(VaultId, &PathBuf, &[u8; 32]); 3] = [
+                (VaultId::A, &dirs.a, &local.a),
+                (VaultId::B, &dirs.b, &local.b),
+                (VaultId::C, &dirs.c, &local.c),
+            ];
+            for (vault, dir, key) in backends {
+                let file_vault = Arc::new(FileVault::open(vault, dir, key)?);
+                let backend: Box<dyn VaultBackend> = Box::new(Arc::clone(&file_vault));
+                vaults.push(file_vault);
+                guards.push(Guarded::new(
+                    backend,
+                    BreakerConfig::default(),
+                    system_clock(),
+                ));
+            }
         }
 
         let rotation = CanaryRotation::new(
@@ -307,10 +488,12 @@ impl Node {
             keys.audit,
         )?);
         let access_audit: Arc<dyn AccessAudit> = Arc::new(NodeAudit::new(Arc::clone(&audit)));
+        let metrics = Arc::new(Metrics::default());
         let source = Source {
             schema: Arc::clone(&schema),
             router: Arc::clone(&router),
             derivation: keys.derivation,
+            metrics: Arc::clone(&metrics),
         };
         let limiter = RateLimiter::new(10, 2, 10_000)?;
         let gateway = Arc::new(
@@ -321,10 +504,12 @@ impl Node {
         let analytics = match &config.analytics {
             Some(analytics_config) => {
                 let policy = load_policy(&analytics_config.policy, &keys.analytics)?;
+                let plan = export_plan(analytics_config)?;
                 Some(Arc::new(Analytics::open(
                     policy,
                     &config.state_dir.join(ANALYTICS_LOG),
                     config.retention_secs,
+                    plan,
                 )?))
             }
             None => None,
@@ -356,6 +541,7 @@ impl Node {
             analytics,
             vaults,
             retention,
+            metrics,
         })
     }
 
@@ -440,6 +626,14 @@ impl Node {
         }
     }
 
+    /// Erases every fragment for `shard` (GDPR erasure). The request is recorded in the audit
+    /// chain before any deletion, and the call fails if the record cannot be written, so no
+    /// erasure happens unrecorded. Repeating the call is safe (see `erase`).
+    pub fn erase_subject(&self, shard: &ShardKey, now: u64) -> Result<EraseReport, ShatterError> {
+        access_audit::record_erasure(&self.audit, shard, now)?;
+        erase(&self.router, &self.derivation, shard)
+    }
+
     /// Erases the fragments in all three vaults whose retention has run out at `now`.
     /// Returns the totals across the vaults.
     pub fn purge_expired(&self, now: u64) -> Result<PurgeReport, ShatterError> {
@@ -449,6 +643,7 @@ impl Node {
             total.purged += report.purged;
             total.malformed += report.malformed;
         }
+        self.metrics.record_purged(total.purged);
         Ok(total)
     }
 
@@ -456,7 +651,31 @@ impl Node {
     /// were emitted. Zero when analytics is off or the gate is not yet met.
     pub fn flush_analytics(&self, now: u64) -> Result<usize, ShatterError> {
         match &self.analytics {
-            Some(analytics) => analytics.flush(now),
+            Some(analytics) => {
+                let emitted = analytics.flush(now)?;
+                self.metrics.record_analytics_emitted(emitted);
+                Ok(emitted)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Produces the Prometheus text for `/metrics`. Vault gauges are read at each call.
+    #[must_use]
+    pub fn metrics_renderer(&self) -> Arc<dyn Fn() -> String + Send + Sync> {
+        let metrics = Arc::clone(&self.metrics);
+        let router = Arc::clone(&self.router);
+        Arc::new(move || {
+            let vaults = router.statuses().unwrap_or_default();
+            metrics.render(&vaults)
+        })
+    }
+
+    /// Writes the scheduled analytics exports at `now`. Returns how many files were written.
+    /// Zero when analytics or the export schedule is off.
+    pub fn write_analytics_exports(&self, now: u64) -> Result<usize, ShatterError> {
+        match &self.analytics {
+            Some(analytics) => analytics.write_exports(now),
             None => Ok(0),
         }
     }
@@ -493,8 +712,11 @@ impl Node {
         });
         let rotator = SigningKeyRotator::new(Arc::clone(&self.signer), next_key);
         let audit = Arc::clone(&self.audit);
-        let notify =
-            Box::new(move |alarm: &Alarm| access_audit::record_alarm(&audit, alarm, now_secs()));
+        let metrics = Arc::clone(&self.metrics);
+        let notify = Box::new(move |alarm: &Alarm| {
+            metrics.record_alarm();
+            access_audit::record_alarm(&audit, alarm, now_secs())
+        });
         AlarmResponder::new(rotator, notify)
     }
 
@@ -503,6 +725,12 @@ impl Node {
         &self,
         access_log: Arc<dyn Fn(&str) + Send + Sync>,
     ) -> Result<Shared<Source>, ShatterError> {
+        // Every access line also feeds the request counters.
+        let metrics = Arc::clone(&self.metrics);
+        let access_log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line: &str| {
+            metrics.record_access_line(line);
+            access_log(line);
+        });
         let router = Arc::clone(&self.router);
         let breakers = Arc::new(move || {
             router
@@ -547,6 +775,65 @@ impl Node {
         fs::write(self.config.state_dir.join(CANARY_EPOCH), epoch.to_string())
             .map_err(|_| ShatterError::Internal)
     }
+}
+
+/// The export schedule from the config. `None` when no exports are configured.
+fn export_plan(config: &AnalyticsConfig) -> Result<Option<ExportPlan>, ShatterError> {
+    if config.exports.is_empty() {
+        return Ok(None);
+    }
+    if config.export_interval_secs == 0 {
+        return Err(ShatterError::InvalidParameter);
+    }
+    let dir = config
+        .export_dir
+        .clone()
+        .ok_or(ShatterError::InvalidParameter)?;
+    Ok(Some(ExportPlan {
+        dir,
+        exports: config.exports.clone(),
+    }))
+}
+
+/// The analytics CSV for `group`: a count per group, or the sum of `value` when given.
+/// Only events inside the retention window count, and groups with fewer than the policy's
+/// `k` events are left out. Reads the analytics log without writing it.
+pub fn export_analytics(
+    config: &Config,
+    keys: &Keys,
+    group: &str,
+    value: Option<&str>,
+) -> Result<String, ShatterError> {
+    let analytics_config = config
+        .analytics
+        .as_ref()
+        .ok_or(ShatterError::InvalidParameter)?;
+    let policy = load_policy(&analytics_config.policy, &keys.analytics)?;
+    let cutoff = now_secs().saturating_sub(config.retention_secs);
+    analytics::export_csv(
+        &config.state_dir.join(ANALYTICS_LOG),
+        policy.k(),
+        cutoff,
+        group,
+        value,
+    )
+}
+
+/// The compliance summary of the audit chain, as one JSON object (see `AuditReport`).
+/// The chain is verified first, so a tampered log gives an error and no report. A missing
+/// log is an empty chain. Reads the audit log without writing it.
+pub fn export_audit(config: &Config, keys: &Keys) -> Result<String, ShatterError> {
+    let path = config.state_dir.join(AUDIT_LOG);
+    let records = match fs::read_to_string(&path) {
+        Ok(text) => text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(AuditRecord::decode_line)
+            .collect::<Result<Vec<_>, _>>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return Err(ShatterError::Internal),
+    };
+    Ok(report(keys.audit, &records)?.to_json())
 }
 
 /// Checks the numeric settings that would otherwise fail deep in a background loop.
@@ -605,9 +892,11 @@ mod tests {
 
     fn keys() -> Keys {
         Keys {
-            vault_a: [0x01; 32],
-            vault_b: [0x02; 32],
-            vault_c: [0x03; 32],
+            vaults: Some(VaultKeys {
+                a: [0x01; 32],
+                b: [0x02; 32],
+                c: [0x03; 32],
+            }),
             derivation: [0x04; 32],
             token: [0x05; 32],
             canary_master: [0x06; 32],
@@ -633,11 +922,12 @@ mod tests {
             allow_plain_http: true,
             schema,
             state_dir: root.join("state"),
-            vault_dirs: VaultDirs {
+            vault_dirs: Some(VaultDirs {
                 a: root.join("vault-a"),
                 b: root.join("vault-b"),
                 c: root.join("vault-c"),
-            },
+            }),
+            remote_vaults: None,
             canary_count: 2,
             canary_period_secs: 7 * 24 * 3600,
             alarm_cooldown_secs: 3600,
@@ -648,6 +938,7 @@ mod tests {
             purge_interval_secs: 3600,
             issuer: None,
             analytics: None,
+            metrics_listen: None,
         }
     }
 
@@ -823,6 +1114,35 @@ mod tests {
         assert_eq!(before.status, 404, "{before:?}");
     }
 
+    /// Collects what a subscriber writes, so a test can inspect the log output.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     #[test]
     fn logs_and_alerts_never_contain_values_tokens_or_shard_keys() {
         let root = temp_root("logscan");
@@ -882,6 +1202,25 @@ mod tests {
             read_token.as_str(),
             write_token.as_str(),
         ];
+        // The same lines, through the JSON subscriber the binary installs. Whatever the
+        // subscriber writes is what an operator's log shipper receives.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(captured.clone())
+            .finish();
+        let sink = access_log_sink();
+        tracing::subscriber::with_default(subscriber, || {
+            for line in &lines {
+                sink(line);
+            }
+        });
+        let json = captured.text();
+        assert!(json.contains("\"access\""), "no events captured: {json}");
+        for secret in secrets {
+            assert!(!json.contains(secret), "json log leaked {secret:?}: {json}");
+        }
+
         fs::remove_dir_all(&root).expect("cleanup");
         for line in &lines {
             assert!(!line.is_empty(), "expected a log line");
@@ -989,6 +1328,9 @@ mod tests {
         let mut cfg = config(&root);
         cfg.analytics = Some(AnalyticsConfig {
             policy: write_policy(&root, 2),
+            export_dir: None,
+            exports: Vec::new(),
+            export_interval_secs: 3600,
         });
         let node = Node::build(cfg, keys()).expect("build");
         let now = now_secs();
@@ -1013,12 +1355,427 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_exports_are_written_to_the_export_directory() {
+        let root = temp_root("exports");
+        let export_dir = root.join("exports");
+        fs::create_dir_all(&export_dir).expect("export dir");
+        let mut cfg = config(&root);
+        cfg.analytics = Some(AnalyticsConfig {
+            policy: write_policy(&root, 2),
+            export_dir: Some(export_dir.clone()),
+            exports: vec![ExportConfig {
+                group: "birth_year".to_owned(),
+                value: None,
+                file: "by_decade.csv".to_owned(),
+            }],
+            export_interval_secs: 60,
+        });
+        let node = Node::build(cfg, keys()).expect("build");
+        let now = now_secs();
+        assert_eq!(write_person(&node, 0x41, "1994", now), 201);
+        assert_eq!(write_person(&node, 0x42, "1996", now), 201);
+        assert_eq!(node.flush_analytics(now).expect("flush"), 2);
+
+        assert_eq!(node.write_analytics_exports(now).expect("export"), 1);
+        let csv = fs::read_to_string(export_dir.join("by_decade.csv")).expect("csv");
+        assert!(
+            !export_dir.join("by_decade.csv.tmp").exists(),
+            "temp file left behind"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(csv, "birth_year,count\n1990-1999,2\n");
+    }
+
+    #[test]
+    fn the_audit_export_counts_verified_events_and_holds_no_digests() {
+        let root = temp_root("audit-export");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        let empty: serde_json::Value =
+            serde_json::from_str(&export_audit(&config(&root), &keys()).expect("empty"))
+                .expect("json");
+        assert_eq!(empty["records"], 0);
+
+        let write = node.writer().expect("writer").write(
+            &token_with(&node, Scope::Write, now),
+            &"7a".repeat(32),
+            &[("name".to_owned(), "A. Example".to_owned())],
+            now * 1000,
+        );
+        assert_eq!(write.status, 201, "{write:?}");
+        let read = node
+            .gateway()
+            .read(&read_token(&node, now), &"7a".repeat(32), now * 1000);
+        assert_eq!(read.status, 200, "{read:?}");
+
+        let text = export_audit(&config(&root), &keys()).expect("export");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(json["records"], 2);
+        assert_eq!(json["by_action"]["ingest"], 1);
+        assert_eq!(json["by_action"]["read"], 1);
+        assert!(json["head_mac"].is_string());
+        assert!(!text.contains(&"7a".repeat(32)), "shard key in the export");
+        assert!(!text.contains("A. Example"), "record value in the export");
+
+        let mut wrong = keys();
+        wrong.audit = [0x09; 32];
+        assert!(
+            export_audit(&config(&root), &wrong).is_err(),
+            "wrong key verified"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn erasure_is_recorded_before_it_deletes_and_leaves_nothing_readable() {
+        use tpt_shatter_common::{AuditAction, AuditRecord};
+
+        let root = temp_root("erase");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        node.shredder().shred(&shard(), record()).expect("shred");
+
+        let report = node.erase_subject(&shard(), now).expect("erase");
+        assert_eq!(report.rows_removed, 3);
+        assert!(report.verified);
+        let read = node
+            .gateway()
+            .read(&read_token(&node, now), &"7a".repeat(32), now * 1000);
+        assert_ne!(read.status, 200, "{read:?}");
+        assert!(read.fields.is_empty());
+
+        let repeat = node.erase_subject(&shard(), now).expect("repeat");
+        assert_eq!(repeat.rows_removed, 0);
+        assert!(repeat.verified);
+
+        let text = fs::read_to_string(root.join("state").join(AUDIT_LOG)).expect("log");
+        assert!(!text.contains(&"7a".repeat(32)), "shard key in the log");
+        let erasures: Vec<AuditRecord> = text
+            .lines()
+            .map(|line| AuditRecord::decode_line(line).expect("decode"))
+            .filter(|r| r.event().action == AuditAction::Erasure)
+            .collect();
+        assert_eq!(erasures.len(), 2, "one record per erasure request");
+        assert!(erasures.iter().all(|r| r.event().vault.is_none()));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Pen-style checks on the token rules, run through the node's gateway. HTTP adds only
+    /// parsing on top of `Gateway::read`, so these exercise the same decisions.
+    #[test]
+    fn keys_load_from_a_directory_and_match_the_environment_source() {
+        let root = temp_root("keys-dir");
+        fs::create_dir_all(&root).expect("dir");
+        for (i, name) in KEY_VARS.iter().enumerate() {
+            fs::write(
+                root.join(name),
+                format!(
+                    "{}
+",
+                    hex_key(i as u8 + 1)
+                ),
+            )
+            .expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o400))
+                    .expect("mode");
+            }
+        }
+        let from_dir = Keys::from_dir(&root).expect("load");
+        let from_env = Keys::from_lookup(|name| {
+            let i = KEY_VARS.iter().position(|v| *v == name)?;
+            Some(hex_key(i as u8 + 1))
+        })
+        .expect("env");
+        assert_eq!(
+            from_dir.vaults.as_ref().map(|v| v.a),
+            from_env.vaults.as_ref().map(|v| v.a)
+        );
+        assert_eq!(from_dir.audit, from_env.audit);
+        assert_eq!(from_dir.analytics, from_env.analytics);
+
+        fs::remove_file(root.join(KEY_VARS[4])).expect("remove");
+        assert!(Keys::from_dir(&root).is_err(), "a missing key loaded");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(root.join(KEY_VARS[4]), hex_key(9)).expect("write");
+            fs::set_permissions(root.join(KEY_VARS[4]), fs::Permissions::from_mode(0o640))
+                .expect("mode");
+            assert!(
+                Keys::from_dir(&root).is_err(),
+                "a group-readable key loaded"
+            );
+        }
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_replayed_token_works_within_its_ttl_and_not_after() {
+        // Decision: replay resistance is the short TTL alone (DECISIONS.md).
+        let root = temp_root("pen-replay");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        node.shredder().shred(&shard(), record()).expect("shred");
+        let token = read_token(&node, now);
+
+        let first = node.gateway().read(&token, &"7a".repeat(32), now * 1000);
+        let replay = node
+            .gateway()
+            .read(&token, &"7a".repeat(32), (now + 1) * 1000);
+        let late = node.gateway().read(
+            &token,
+            &"7a".repeat(32),
+            (now + 10 * tpt_shatter_common::DEFAULT_TOKEN_TTL_SECS) * 1000,
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(first.status, 200, "{first:?}");
+        assert_eq!(replay.status, 200, "{replay:?}");
+        assert_ne!(late.status, 200, "{late:?}");
+        assert!(late.fields.is_empty());
+    }
+
+    #[test]
+    fn a_tampered_or_mis_scoped_token_reads_nothing() {
+        let root = temp_root("pen-tamper");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        node.shredder().shred(&shard(), record()).expect("shred");
+        let token = read_token(&node, now);
+
+        // Flip the last character of the signature.
+        let mut tampered = token.clone();
+        let last = tampered.pop().expect("token");
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        let flipped = node.gateway().read(&tampered, &"7a".repeat(32), now * 1000);
+        assert_ne!(flipped.status, 200, "{flipped:?}");
+        assert!(flipped.fields.is_empty());
+
+        // A token for shard 7a presented for shard 7b.
+        let other = node.gateway().read(&token, &"7b".repeat(32), now * 1000);
+        assert_ne!(other.status, 200, "{other:?}");
+        assert!(other.fields.is_empty());
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Measurement, not a gate. Prints latency percentiles for the assembler read path.
+    /// Run with `cargo test -p tpt-shatter-node read_path_latency -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement only: run with --ignored --nocapture"]
+    fn read_path_latency() {
+        use std::time::Instant;
+        use tpt_shatter_assembler::assemble_with_deadline;
+
+        let root = temp_root("latency");
+        let node = Node::build(config(&root), keys()).expect("build");
+        node.shredder().shred(&shard(), record()).expect("shred");
+        let router = node.router();
+
+        const SAMPLES: usize = 500;
+        let mut micros: Vec<u128> = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            let rebuilt = assemble_with_deadline(
+                &node.schema,
+                &router,
+                &node.derivation,
+                &shard(),
+                READ_DEADLINE,
+            )
+            .expect("assemble");
+            micros.push(started.elapsed().as_micros());
+            assert_eq!(rebuilt.len(), 3);
+        }
+        micros.sort_unstable();
+        let pct = |p: usize| micros[(SAMPLES * p / 100).min(SAMPLES - 1)];
+        println!(
+            "read path, {SAMPLES} reads, 3 vaults, in-process file vaults: p50 {} us, p95 {} us, p99 {} us",
+            pct(50),
+            pct(95),
+            pct(99)
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn reads_are_attributed_to_the_caller_the_token_was_issued_to() {
+        use tpt_shatter_common::{
+            AuditAction, AuditRecord, CALLER_TAG_LEN, DEFAULT_TOKEN_TTL_SECS,
+        };
+
+        let root = temp_root("attribution");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        node.shredder().shred(&shard(), record()).expect("shred");
+
+        let tag = [0x5C; CALLER_TAG_LEN];
+        let token = node
+            .signer()
+            .read()
+            .expect("lock")
+            .issue_for(
+                &tag,
+                &shard(),
+                Scopes::from_scopes(&[Scope::Read]),
+                now,
+                DEFAULT_TOKEN_TTL_SECS,
+            )
+            .expect("issue");
+        let read = node.gateway().read(&token, &"7a".repeat(32), now * 1000);
+        assert_eq!(read.status, 200, "{read:?}");
+
+        let text = fs::read_to_string(root.join("state").join(AUDIT_LOG)).expect("log");
+        fs::remove_dir_all(&root).expect("cleanup");
+        let reads: Vec<AuditRecord> = text
+            .lines()
+            .map(|line| AuditRecord::decode_line(line).expect("decode"))
+            .filter(|r| r.event().action == AuditAction::Read)
+            .collect();
+        assert_eq!(reads.len(), 1);
+        let expected =
+            tpt_shatter_vault_client::keyed_digest(&keys().audit, b"tpt-shatter/caller", &tag)
+                .expect("digest");
+        assert_eq!(reads[0].event().caller, Some(expected));
+        assert!(
+            !text.contains(&"5c".repeat(CALLER_TAG_LEN)),
+            "raw caller tag in the log"
+        );
+    }
+
+    #[test]
+    fn a_record_round_trips_through_three_remote_vault_services() {
+        use std::net::TcpListener;
+        use tpt_shatter_vault_client::FileVault;
+        use tpt_shatter_vault_service::{serve, server_tls};
+
+        // TEST-ONLY certificates from the gateway's fixtures, for loopback TLS.
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tpt-shatter-gateway/tests/fixtures/"
+        );
+        let fixture = |name: &str| PathBuf::from(format!("{fixtures}{name}"));
+        let root = temp_root("remote");
+
+        let mut addresses = Vec::new();
+        for (vault, key_byte) in [(VaultId::A, 0x21u8), (VaultId::B, 0x22), (VaultId::C, 0x23)] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            addresses.push(listener.local_addr().expect("addr").to_string());
+            let dir = root.join(format!("service-{}", vault.label()));
+            let store = Arc::new(FileVault::open(vault, &dir, &[key_byte; 32]).expect("open"));
+            let tls = server_tls(
+                &fs::read(fixture("server.pem")).expect("cert"),
+                &fs::read(fixture("server.key")).expect("key"),
+                &fs::read(fixture("ca.pem")).expect("ca"),
+            )
+            .expect("tls");
+            let backend: Arc<dyn VaultBackend> = store;
+            std::thread::spawn(move || {
+                let _ = serve(listener, tls, backend);
+            });
+        }
+
+        let mut cfg = config(&root);
+        cfg.vault_dirs = None;
+        cfg.remote_vaults = Some(RemoteVaults {
+            a: addresses[0].clone(),
+            b: addresses[1].clone(),
+            c: addresses[2].clone(),
+            server_name: "localhost".to_owned(),
+            ca: fixture("ca.pem"),
+            client_cert: fixture("client.pem"),
+            client_key: fixture("client.key"),
+        });
+        // The node holds no vault keys in this mode.
+        let mut node_keys = keys();
+        node_keys.vaults = None;
+        let node = Node::build(cfg, node_keys).expect("build");
+
+        let now = now_secs();
+        node.shredder().shred(&shard(), record()).expect("shred");
+        let read = node
+            .gateway()
+            .read(&read_token(&node, now), &"7a".repeat(32), now * 1000);
+        assert_eq!(read.status, 200, "{read:?}");
+        assert!(
+            read.fields
+                .contains(&("name".to_owned(), "A. Example".to_owned()))
+        );
+
+        // Each service holds exactly its own fragment.
+        for label in ['A', 'B', 'C'] {
+            let files = fs::read_dir(root.join(format!("service-{label}")))
+                .expect("service dir")
+                .count();
+            assert_eq!(files, 1, "vault {label}");
+        }
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_fragment_copied_into_another_vault_reads_nothing() {
+        // An attacker with file access copies vault B's fragment over vault A's file. Each
+        // fragment is sealed with its vault label and FragmentId as associated data, so the
+        // copy must fail to open rather than yield a field.
+        let root = temp_root("pen-cross");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        node.shredder().shred(&shard(), record()).expect("shred");
+        let token = read_token(&node, now);
+        let control = node.gateway().read(&token, &"7a".repeat(32), now * 1000);
+        assert_eq!(control.status, 200, "{control:?}");
+
+        let only_file = |dir: PathBuf| -> PathBuf {
+            let files: Vec<PathBuf> = fs::read_dir(&dir)
+                .expect("dir")
+                .map(|entry| entry.expect("entry").path())
+                .collect();
+            assert_eq!(files.len(), 1, "one fragment per vault in {dir:?}");
+            files[0].clone()
+        };
+        let from_b = only_file(root.join("vault-b"));
+        let into_a = only_file(root.join("vault-a"));
+        fs::copy(&from_b, &into_a).expect("copy");
+
+        let read = node
+            .gateway()
+            .read(&read_token(&node, now), &"7a".repeat(32), now * 1000);
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_ne!(read.status, 200, "{read:?}");
+        assert!(read.fields.is_empty());
+    }
+
+    #[test]
+    fn an_export_name_that_is_not_a_plain_file_name_is_refused() {
+        let root = temp_root("export-name");
+        let mut cfg = config(&root);
+        cfg.analytics = Some(AnalyticsConfig {
+            policy: write_policy(&root, 2),
+            export_dir: Some(root.clone()),
+            exports: vec![ExportConfig {
+                group: "birth_year".to_owned(),
+                value: None,
+                file: "../escape.csv".to_owned(),
+            }],
+            export_interval_secs: 60,
+        });
+        let result = Node::build(cfg, keys()).err();
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(result, Some(ShatterError::InvalidParameter));
+    }
+
+    #[test]
     fn analytics_events_expire_with_the_retention_window() {
         let root = temp_root("analytics-purge");
         let mut cfg = config(&root);
         let retention = cfg.retention_secs;
         cfg.analytics = Some(AnalyticsConfig {
             policy: write_policy(&root, 1),
+            export_dir: None,
+            exports: Vec::new(),
+            export_interval_secs: 3600,
         });
         let node = Node::build(cfg, keys()).expect("build");
         let now = now_secs();

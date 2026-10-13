@@ -9,6 +9,10 @@ use crate::shard_key::ShardKey;
 /// Default time-to-live for a capability token, in seconds.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 60;
 
+/// Length of the caller tag a token carries. The tag is the first 16 bytes of the caller's
+/// name digest, so it is not a secret and does not identify anyone beyond the name.
+pub const CALLER_TAG_LEN: usize = 16;
+
 /// An action a token may authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -72,6 +76,7 @@ pub struct CapabilityToken {
     scopes: Scopes,
     issued_at: u64,
     expires_at: u64,
+    caller: [u8; CALLER_TAG_LEN],
     shard_key: ShardKey,
 }
 
@@ -83,6 +88,7 @@ impl CapabilityToken {
         scopes: Scopes,
         issued_at: u64,
         ttl_secs: u64,
+        caller: [u8; CALLER_TAG_LEN],
         shard_key: ShardKey,
     ) -> Self {
         Self {
@@ -90,6 +96,7 @@ impl CapabilityToken {
             scopes,
             issued_at,
             expires_at: issued_at.saturating_add(ttl_secs),
+            caller,
             shard_key,
         }
     }
@@ -104,6 +111,13 @@ impl CapabilityToken {
     #[must_use]
     pub const fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// The caller tag the token was issued under. All zeros means the token was issued
+    /// without a caller.
+    #[must_use]
+    pub const fn caller(&self) -> &[u8; CALLER_TAG_LEN] {
+        &self.caller
     }
 
     /// The shard this token is bound to.
@@ -158,6 +172,7 @@ mod tests {
             Scopes::from_scopes(&[Scope::Read]),
             issued_at,
             DEFAULT_TOKEN_TTL_SECS,
+            [0; CALLER_TAG_LEN],
             ShardKey::from_bytes([3; 32]),
         )
     }
@@ -213,6 +228,7 @@ mod tests {
             Scopes::NONE,
             u64::MAX - 1,
             DEFAULT_TOKEN_TTL_SECS,
+            [0; CALLER_TAG_LEN],
             ShardKey::from_bytes([0; 32]),
         );
         assert_eq!(t.expires_at(), u64::MAX);

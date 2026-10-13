@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             token_digest,
             shard_digest,
             vault,
+            caller: None,
             at,
         })?);
     }
