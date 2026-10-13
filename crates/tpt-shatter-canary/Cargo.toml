@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-canary"
-description = "tpt-shatter: canary crate (scaffold)."
+description = "Canary (honeytoken) records for tpt-shatter, with epoch rotation, in-band access detection, and alarm response."
+readme = "README.md"
+repository.workspace = true
+keywords = ["honeytoken", "canary", "intrusion-detection", "decoy-data", "alerting"]
+categories = ["cryptography"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

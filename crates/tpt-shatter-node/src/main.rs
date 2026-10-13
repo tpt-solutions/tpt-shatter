@@ -103,10 +103,12 @@ fn run() -> Result<(), String> {
     })
 }
 
-/// Erases expired fragments once per interval, until stopped. Logs counts only.
+/// Erases expired fragments and analytics events once per interval, until stopped.
+/// Logs counts only.
 fn purge_loop(node: &Node, interval: Duration, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
-        match node.purge_expired(now_secs()) {
+        let now = now_secs();
+        match node.purge_expired(now) {
             Ok(report) if report.purged > 0 || report.malformed > 0 => {
                 eprintln!(
                     "retention: purged {} expired fragment(s); {} file(s) did not authenticate",
@@ -115,6 +117,11 @@ fn purge_loop(node: &Node, interval: Duration, stop: &AtomicBool) {
             }
             Ok(_) => {}
             Err(e) => eprintln!("retention purge failed: {e}"),
+        }
+        match node.purge_analytics(now) {
+            Ok(0) => {}
+            Ok(erased) => eprintln!("analytics: erased {erased} expired event(s)"),
+            Err(e) => eprintln!("analytics purge failed: {e}"),
         }
         thread::sleep(interval);
     }
@@ -144,6 +151,11 @@ fn monitor_loop(node: &Node, interval: Duration, stop: &AtomicBool) {
             }
             Ok(Outcome::Quiet) => {}
             Err(e) => eprintln!("alarm response failed: {e}"),
+        }
+        match node.flush_analytics(now) {
+            Ok(0) => {}
+            Ok(emitted) => eprintln!("analytics: emitted {emitted} event(s)"),
+            Err(e) => eprintln!("analytics flush failed: {e}"),
         }
         thread::sleep(interval);
     }

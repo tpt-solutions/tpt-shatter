@@ -15,7 +15,7 @@ use tpt_shatter_common::{Record, Scope, ShardKey, ShatterError};
 use tpt_shatter_token::Signer;
 
 use crate::ratelimit::RateLimiter;
-use crate::service::{Response, hex, public_error};
+use crate::service::{AccessAudit, Response, hex, public_error};
 
 /// Stores a record under a shard. A node implements it over the shredder.
 pub trait RecordSink: Send + Sync {
@@ -37,6 +37,7 @@ pub struct Writer<S: RecordSink> {
     signer: Arc<RwLock<Signer>>,
     sink: S,
     limiter: Mutex<RateLimiter>,
+    audit: Option<Arc<dyn AccessAudit>>,
 }
 
 impl<S: RecordSink> Writer<S> {
@@ -48,7 +49,15 @@ impl<S: RecordSink> Writer<S> {
             signer,
             sink,
             limiter: Mutex::new(limiter),
+            audit: None,
         }
+    }
+
+    /// Records every authorized write through `audit`, before the record is stored.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AccessAudit>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Stores `fields` under `shard_hex`, authorized by `token`, at `now_ms`.
@@ -108,6 +117,9 @@ impl<S: RecordSink> Writer<S> {
             if record.insert(name.as_str(), value.as_str()).is_some() {
                 return Err(ShatterError::InvalidParameter);
             }
+        }
+        if let Some(audit) = &self.audit {
+            audit.authorized(Scope::Write, token, &shard, now_ms / 1000)?;
         }
         self.sink.store(&shard, record)
     }

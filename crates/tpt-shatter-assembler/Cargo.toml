@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-assembler"
-description = "tpt-shatter: assembler crate (scaffold)."
+description = "Ephemeral reconstruction of records from their fragments, deadline-bounded assembly, and online schema migration for tpt-shatter."
+readme = "README.md"
+repository.workspace = true
+keywords = ["reconstruction", "schema-migration", "fragments", "sharding", "data-security"]
+categories = ["cryptography", "data-structures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

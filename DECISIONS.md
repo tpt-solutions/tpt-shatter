@@ -133,10 +133,30 @@ that is said. Changing a decision means editing this file and the checklist toge
 ## Analytics durability (added after the upstream check)
 
 - **The durable copy of anonymized events is an append-only JSON-lines file**
-  (`JsonlSink` in `tpt-shatter-emitter`), one object per line, fsynced per batch. Strata
+  (`StrataSink` in `tpt-shatter-emitter`), one object per line, fsynced per batch. Strata
   is rebuilt from that file on start. Strata has no documented persistence (see
   `UPSTREAM.md`), so it must not be the only copy.
 - Only policy-approved fields reach the file, so it holds anonymized data only.
+
+## Analytics retention and feed (decided)
+
+- **Retention: analytics events live as long as vault fragments**, `retention_secs`
+  (30 days by default). Each log line carries its storage time. `StrataSink::purge_before`
+  removes older events from the log, rewritten through a temp file and rename, and from
+  the view. Memory is therefore bounded by the window and the ingest rate. A separate
+  analytics retention knob was not added, because a longer window would keep more
+  identifying detail about the same people than the vault keeps.
+- **Feed: anonymize at ingest, gate at flush.** Each accepted write is anonymized before
+  it is stored. Only the anonymized event is held, never the raw record. Held events are
+  emitted once the k-anonymity gate passes over all of them. Events not yet emitted when
+  their window ends are dropped. A write whose anonymization fails is refused, so an
+  event never exists for a write that was not stored.
+- **Policy file and salt.** The policy is a JSON file named by `analytics.policy` in the
+  node config. The pseudonym salt is `TPT_KEY_ANALYTICS`, which is required even when
+  analytics is off, so the key set is the same on every node.
+- **Known gaps:** the feed holds events in memory until the gate passes, so a low-volume
+  node may hold a few events for a long time. The gate is checked over everything held,
+  so one small cohort can hold back all analytics output until it grows.
 
 ## Audit anchoring (added after the upstream check)
 

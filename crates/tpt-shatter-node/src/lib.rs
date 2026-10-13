@@ -24,18 +24,23 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Deserialize;
 use tpt_shatter_assembler::Assembler;
-use tpt_shatter_canary::{CanaryMonitor, CanaryRotation, CanaryWatch, refresh_canaries};
+use tpt_shatter_canary::{Alarm, CanaryMonitor, CanaryRotation, CanaryWatch, refresh_canaries};
 use tpt_shatter_common::{
     AlertLog, Record, RetentionPolicy, ShardKey, ShatterError, ShatterSchema, VaultId,
 };
 use tpt_shatter_gateway::{
-    AlarmResponder, Gateway, HttpConfig, RateLimiter, RecordSink, RecordSource, Shared,
-    SigningKeyRotator, WriteHandler, Writer,
+    AccessAudit, AlarmResponder, Gateway, HttpConfig, RateLimiter, RecordSink, RecordSource,
+    Shared, SigningKeyRotator, WriteHandler, Writer,
 };
 use tpt_shatter_shredder::{OrphanStore, Shredder};
 
+use access_audit::NodeAudit;
 pub use issuer::{AuditStore, IssueOutcome, Issuer, IssuerConfig, serve_issuer};
+mod access_audit;
+mod analytics;
 mod issuer;
+
+use analytics::{Analytics, load_policy};
 use tpt_shatter_token::Signer;
 use tpt_shatter_vault_client::{
     AccessObserver, BreakerConfig, BreakerState, FileVault, Guarded, PurgeReport, Router,
@@ -46,7 +51,17 @@ use tpt_shatter_vault_client::{
 const ORPHAN_LOG: &str = "orphans.jsonl";
 const AUDIT_LOG: &str = "audit.jsonl";
 const ALERT_LOG: &str = "alerts.jsonl";
+const ANALYTICS_LOG: &str = "analytics.jsonl";
 const CANARY_EPOCH: &str = "canary_epoch";
+
+/// The analytics feed. Off unless the config names a policy file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyticsConfig {
+    /// The anonymization policy (JSON). See `analytics.rs` for the format. Its events are kept
+    /// for `retention_secs`, the same window as vault fragments.
+    pub policy: PathBuf,
+}
 
 /// Where each vault keeps its files.
 #[derive(Debug, Clone, Deserialize)]
@@ -103,9 +118,12 @@ pub struct Config {
     /// The token issuer. Absent means no issuer runs on this node.
     #[serde(default)]
     pub issuer: Option<IssuerConfig>,
+    /// The analytics feed. Absent means accepted writes are not fed to analytics.
+    #[serde(default)]
+    pub analytics: Option<AnalyticsConfig>,
 }
 
-/// The six 32-byte keys a node needs. Each is 64 hex characters in the environment.
+/// The eight 32-byte keys a node needs. Each is 64 hex characters in the environment.
 ///
 /// Keys are read from the environment at boot and held in RAM. Key delivery from a
 /// secret store is not built, so the environment is the interim source.
@@ -124,10 +142,13 @@ pub struct Keys {
     pub canary_master: [u8; 32],
     /// Key the issuer's audit chain is verified and sealed under.
     pub audit: [u8; 32],
+    /// Salt for pseudonyms in the analytics feed. Used even when analytics is off, so a
+    /// node always has the same key set.
+    pub analytics: [u8; 32],
 }
 
 /// Environment variable names for each key.
-pub const KEY_VARS: [&str; 7] = [
+pub const KEY_VARS: [&str; 8] = [
     "TPT_KEY_VAULT_A",
     "TPT_KEY_VAULT_B",
     "TPT_KEY_VAULT_C",
@@ -135,6 +156,7 @@ pub const KEY_VARS: [&str; 7] = [
     "TPT_KEY_TOKEN",
     "TPT_KEY_CANARY_MASTER",
     "TPT_KEY_AUDIT",
+    "TPT_KEY_ANALYTICS",
 ];
 
 impl Keys {
@@ -154,6 +176,7 @@ impl Keys {
             token: get(KEY_VARS[4])?,
             canary_master: get(KEY_VARS[5])?,
             audit: get(KEY_VARS[6])?,
+            analytics: get(KEY_VARS[7])?,
         })
     }
 }
@@ -197,29 +220,45 @@ pub struct Node {
     gateway: Arc<Gateway<Source>>,
     orphans: Arc<OrphanStore>,
     issuer: Option<Arc<Issuer>>,
+    /// The audit chain, shared by the issuer, the gateway, and the alarm response.
+    audit: Arc<AuditStore>,
+    /// The gateway's and writer's audit hook over `audit`.
+    access_audit: Arc<dyn AccessAudit>,
+    /// The analytics feed, when the config enables it.
+    analytics: Option<Arc<Analytics>>,
     /// The same vault instances the router uses, kept for the purge pass.
     vaults: Vec<Arc<FileVault>>,
     retention: RetentionPolicy,
 }
 
-/// Stores a shredded record through the node's shredder and its shared orphan store.
+/// Stores a shredded record through the node's shredder and its shared orphan store, and
+/// feeds its anonymized form to analytics once the record is stored.
 pub struct IngestSink {
     schema: Arc<ShatterSchema>,
     router: Arc<Router>,
     derivation: [u8; 32],
     orphans: Arc<OrphanStore>,
+    analytics: Option<Arc<Analytics>>,
 }
 
 impl RecordSink for IngestSink {
     fn store(&self, shard: &ShardKey, record: Record) -> Result<(), ShatterError> {
+        // Anonymize before the shredder consumes the record. A failure refuses the write.
+        let prepared = match &self.analytics {
+            Some(analytics) => Some(analytics.prepare(&record)?),
+            None => None,
+        };
         Shredder::with_store(
             &self.schema,
             &self.router,
             self.derivation,
             Arc::clone(&self.orphans),
         )
-        .shred(shard, record)
-        .map(|_| ())
+        .shred(shard, record)?;
+        if let (Some(analytics), Some(events)) = (&self.analytics, prepared) {
+            analytics.hold(events, now_secs())?;
+        }
+        Ok(())
     }
 }
 
@@ -263,24 +302,41 @@ impl Node {
         let router = Arc::new(Router::new(guards)?.with_observer(observer));
 
         let signer = Arc::new(RwLock::new(Signer::new(1, keys.token)));
+        let audit = Arc::new(AuditStore::open(
+            &config.state_dir.join(AUDIT_LOG),
+            keys.audit,
+        )?);
+        let access_audit: Arc<dyn AccessAudit> = Arc::new(NodeAudit::new(Arc::clone(&audit)));
         let source = Source {
             schema: Arc::clone(&schema),
             router: Arc::clone(&router),
             derivation: keys.derivation,
         };
         let limiter = RateLimiter::new(10, 2, 10_000)?;
-        let gateway = Arc::new(Gateway::new(Arc::clone(&signer), source, limiter));
+        let gateway = Arc::new(
+            Gateway::new(Arc::clone(&signer), source, limiter)
+                .with_audit(Arc::clone(&access_audit)),
+        );
+
+        let analytics = match &config.analytics {
+            Some(analytics_config) => {
+                let policy = load_policy(&analytics_config.policy, &keys.analytics)?;
+                Some(Arc::new(Analytics::open(
+                    policy,
+                    &config.state_dir.join(ANALYTICS_LOG),
+                    config.retention_secs,
+                )?))
+            }
+            None => None,
+        };
 
         let orphans = Arc::new(OrphanStore::open(&config.state_dir.join(ORPHAN_LOG))?);
         let issuer = match config.issuer.clone() {
-            Some(issuer_config) => {
-                let audit = AuditStore::open(&config.state_dir.join(AUDIT_LOG), keys.audit)?;
-                Some(Arc::new(Issuer::new(
-                    Arc::clone(&signer),
-                    &issuer_config,
-                    audit,
-                )?))
-            }
+            Some(issuer_config) => Some(Arc::new(Issuer::new(
+                Arc::clone(&signer),
+                &issuer_config,
+                Arc::clone(&audit),
+            )?)),
             None => None,
         };
 
@@ -295,6 +351,9 @@ impl Node {
             gateway,
             orphans,
             issuer,
+            audit,
+            access_audit,
+            analytics,
             vaults,
             retention,
         })
@@ -349,12 +408,14 @@ impl Node {
             router: Arc::clone(&self.router),
             derivation: self.derivation,
             orphans: Arc::clone(&self.orphans),
+            analytics: self.analytics.clone(),
         };
         Ok(Writer::new(
             Arc::clone(&self.signer),
             sink,
             RateLimiter::new(10, 2, 10_000)?,
-        ))
+        )
+        .with_audit(Arc::clone(&self.access_audit)))
     }
 
     /// Writes the canaries for the epoch containing `now` if they are not there yet, and
@@ -391,6 +452,23 @@ impl Node {
         Ok(total)
     }
 
+    /// Emits held analytics events whose k-anonymity gate passes at `now`. Returns how many
+    /// were emitted. Zero when analytics is off or the gate is not yet met.
+    pub fn flush_analytics(&self, now: u64) -> Result<usize, ShatterError> {
+        match &self.analytics {
+            Some(analytics) => analytics.flush(now),
+            None => Ok(0),
+        }
+    }
+
+    /// Erases analytics events past the retention window at `now`. Returns how many.
+    pub fn purge_analytics(&self, now: u64) -> Result<usize, ShatterError> {
+        match &self.analytics {
+            Some(analytics) => analytics.purge(now),
+            None => Ok(0),
+        }
+    }
+
     /// A monitor that drains the canary watch into the alarm gate and the alert log.
     pub fn monitor(&self) -> Result<CanaryMonitor, ShatterError> {
         Ok(CanaryMonitor::new(
@@ -405,8 +483,8 @@ impl Node {
         AlertLog::open(&self.config.state_dir.join(ALERT_LOG))
     }
 
-    /// The alarm response: rotate the token key, then notify. The notification is a no-op
-    /// here, because the monitor writes every alarm to the alert log.
+    /// The alarm response: rotate the token key, then notify. The notification writes the
+    /// alarm to the audit chain. The monitor also writes every alarm to the alert log.
     pub fn responder(&self) -> AlarmResponder {
         let version = Arc::new(AtomicU32::new(1));
         let next_key = Box::new(move || {
@@ -414,7 +492,10 @@ impl Node {
             Ok((v, random_key()))
         });
         let rotator = SigningKeyRotator::new(Arc::clone(&self.signer), next_key);
-        AlarmResponder::new(rotator, Box::new(|_| Ok(())))
+        let audit = Arc::clone(&self.audit);
+        let notify =
+            Box::new(move |alarm: &Alarm| access_audit::record_alarm(&audit, alarm, now_secs()));
+        AlarmResponder::new(rotator, notify)
     }
 
     /// Shared state for the HTTP layer. `access_log` receives one line per request.
@@ -531,6 +612,7 @@ mod tests {
             token: [0x05; 32],
             canary_master: [0x06; 32],
             audit: [0x07; 32],
+            analytics: [0x08; 32],
         }
     }
 
@@ -565,6 +647,7 @@ mod tests {
             retention_secs: 30 * 24 * 3600,
             purge_interval_secs: 3600,
             issuer: None,
+            analytics: None,
         }
     }
 
@@ -806,6 +889,155 @@ mod tests {
                 assert!(!line.contains(secret), "log leaked {secret:?}: {line}");
             }
         }
+    }
+
+    #[test]
+    fn writes_reads_and_alarms_are_audited_without_raw_values() {
+        use tpt_shatter_canary::{Alarm, Responder};
+        use tpt_shatter_common::{AuditAction, AuditRecord, VaultId, verify_chain};
+
+        let root = temp_root("audited");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+
+        let write = node.writer().expect("writer").write(
+            &token_with(&node, Scope::Write, now),
+            &"7a".repeat(32),
+            &[("name".to_owned(), "A. Example".to_owned())],
+            now * 1000,
+        );
+        assert_eq!(write.status, 201, "{write:?}");
+        let read = node
+            .gateway()
+            .read(&read_token(&node, now), &"7a".repeat(32), now * 1000);
+        assert_eq!(read.status, 200, "{read:?}");
+        node.responder()
+            .notify_security(&Alarm {
+                vault: VaultId::C,
+                index: 0,
+            })
+            .expect("notify");
+
+        let text = fs::read_to_string(root.join("state").join(AUDIT_LOG)).expect("log");
+        let records: Vec<AuditRecord> = text
+            .lines()
+            .map(|line| AuditRecord::decode_line(line).expect("decode"))
+            .collect();
+        assert_eq!(verify_chain(keys().audit, &records), Ok(()));
+        let actions: Vec<AuditAction> = records.iter().map(|r| r.event().action).collect();
+        assert_eq!(
+            actions,
+            [AuditAction::Ingest, AuditAction::Read, AuditAction::Alarm]
+        );
+        assert_eq!(records[2].event().vault, Some(VaultId::C));
+        assert!(!text.contains(&"7a".repeat(32)), "shard key in the log");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A write token for the shard whose bytes are all `byte`.
+    fn write_token_for(node: &Node, byte: u8, now: u64) -> String {
+        node.signer()
+            .read()
+            .expect("lock")
+            .issue(
+                &ShardKey::from_bytes([byte; 32]),
+                Scopes::from_scopes(&[Scope::Write]),
+                now,
+            )
+            .expect("issue")
+            .as_str()
+            .to_owned()
+    }
+
+    /// Writes one person to the shard `byte`. Returns the HTTP-style status.
+    fn write_person(node: &Node, byte: u8, year: &str, now: u64) -> u16 {
+        let fields = [
+            ("name".to_owned(), "A. Example".to_owned()),
+            ("birth_year".to_owned(), year.to_owned()),
+            ("card_number".to_owned(), "4111111111111111".to_owned()),
+        ];
+        node.writer()
+            .expect("writer")
+            .write(
+                &write_token_for(node, byte, now),
+                &format!("{byte:02x}").repeat(32),
+                &fields,
+                now * 1000,
+            )
+            .status
+    }
+
+    /// Writes a policy file with the given `k`, bucketing years and masking cards.
+    fn write_policy(root: &Path, k: usize) -> PathBuf {
+        let path = root.join("policy.json");
+        let policy = serde_json::json!({
+            "k": k,
+            "quasi_identifiers": ["birth_year"],
+            "rules": {
+                "name": "pseudonymize",
+                "birth_year": {"bucket": {"width": 10}},
+                "card_number": {"mask": {"keep_last": 4}}
+            }
+        });
+        fs::write(&path, policy.to_string()).expect("policy");
+        path
+    }
+
+    #[test]
+    fn analytics_holds_each_write_until_the_gate_passes_then_emits_anonymized_events() {
+        let root = temp_root("analytics");
+        let mut cfg = config(&root);
+        cfg.analytics = Some(AnalyticsConfig {
+            policy: write_policy(&root, 2),
+        });
+        let node = Node::build(cfg, keys()).expect("build");
+        let now = now_secs();
+        let log = root.join("state").join(ANALYTICS_LOG);
+
+        assert_eq!(write_person(&node, 0x31, "1994", now), 201);
+        assert_eq!(
+            node.flush_analytics(now).expect("flush"),
+            0,
+            "one event is below k=2"
+        );
+        assert_eq!(fs::read_to_string(&log).expect("log"), "");
+
+        assert_eq!(write_person(&node, 0x32, "1996", now), 201);
+        assert_eq!(node.flush_analytics(now).expect("flush"), 2);
+        let text = fs::read_to_string(&log).expect("log");
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("1990-1999"), "bucket missing: {text}");
+        assert!(!text.contains("A. Example"), "name leaked: {text}");
+        assert!(!text.contains("4111111111"), "card leaked: {text}");
+    }
+
+    #[test]
+    fn analytics_events_expire_with_the_retention_window() {
+        let root = temp_root("analytics-purge");
+        let mut cfg = config(&root);
+        let retention = cfg.retention_secs;
+        cfg.analytics = Some(AnalyticsConfig {
+            policy: write_policy(&root, 1),
+        });
+        let node = Node::build(cfg, keys()).expect("build");
+        let now = now_secs();
+
+        assert_eq!(write_person(&node, 0x33, "1994", now), 201);
+        assert_eq!(node.flush_analytics(now).expect("flush"), 1);
+        // The event was stored a moment after `now`, so the offsets leave room for that.
+        assert_eq!(
+            node.purge_analytics(now + retention - 10).expect("purge"),
+            0,
+            "still inside the window"
+        );
+        assert_eq!(
+            node.purge_analytics(now + retention + 10).expect("purge"),
+            1
+        );
+        let text = fs::read_to_string(root.join("state").join(ANALYTICS_LOG)).expect("log");
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(text, "");
     }
 
     #[test]

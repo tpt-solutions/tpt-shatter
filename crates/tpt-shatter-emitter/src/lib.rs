@@ -253,16 +253,25 @@ impl<S: EventSink> Emitter<S> {
     /// quasi-identifier cohort is smaller than `k`. Nothing is emitted in that case.
     /// Records are consumed, so their values are zeroed on drop.
     pub fn emit(&self, records: Vec<Record>) -> Result<EmitReport, ShatterError> {
-        let events = records
-            .iter()
-            .map(|r| self.policy.transform(r))
-            .collect::<Result<Vec<_>, _>>()?;
+        let events = self.anonymize(&records)?;
         drop(records);
-        check_k_anonymity(&self.policy.cohort_sizes(&events), self.policy.k)?;
+        self.check_k(&events)?;
         self.sink.emit(&events)?;
         Ok(EmitReport {
             emitted: events.len(),
         })
+    }
+
+    /// Anonymizes `records` without gating or emitting. A caller can hold the result and
+    /// emit it later with [`Emitter::check_k`] and the sink, so only anonymized events are
+    /// ever held.
+    pub fn anonymize(&self, records: &[Record]) -> Result<Vec<Event>, ShatterError> {
+        records.iter().map(|r| self.policy.transform(r)).collect()
+    }
+
+    /// Applies the k-anonymity gate to `events` without emitting them.
+    pub fn check_k(&self, events: &[Event]) -> Result<(), ShatterError> {
+        check_k_anonymity(&self.policy.cohort_sizes(events), self.policy.k)
     }
 }
 

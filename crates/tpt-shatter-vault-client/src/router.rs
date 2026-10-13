@@ -115,6 +115,15 @@ impl Router {
         self.vault(vault)?.delete(id)
     }
 
+    /// Reads a fragment for internal maintenance, such as schema migration. Not observed.
+    pub fn get_maintenance(
+        &self,
+        vault: VaultId,
+        id: &FragmentId,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, ShatterError> {
+        self.vault(vault)?.get(id)
+    }
+
     /// Reports whether a fragment exists, without returning its contents. Not observed.
     /// Used by erasure to verify deletions. Its existence is only visible to code that
     /// already holds the router.

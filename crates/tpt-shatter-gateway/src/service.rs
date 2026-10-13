@@ -83,11 +83,27 @@ pub const fn public_error(error: ShatterError) -> (u16, &'static str) {
     }
 }
 
+/// Records an operation after it has been authorized and before it runs.
+///
+/// Called on the read and write paths once the token is verified. An error here stops the
+/// operation, so nothing is read or stored without an audit record (fail closed).
+pub trait AccessAudit: Send + Sync {
+    /// Records an authorized `scope` operation on `shard` by `token` at `now` (Unix seconds).
+    fn authorized(
+        &self,
+        scope: Scope,
+        token: &str,
+        shard: &ShardKey,
+        now: u64,
+    ) -> Result<(), ShatterError>;
+}
+
 /// The public read path.
 pub struct Gateway<R: RecordSource> {
     signer: Arc<RwLock<Signer>>,
     source: R,
     limiter: Mutex<RateLimiter>,
+    audit: Option<Arc<dyn AccessAudit>>,
 }
 
 impl<R: RecordSource> Gateway<R> {
@@ -99,7 +115,15 @@ impl<R: RecordSource> Gateway<R> {
             signer,
             source,
             limiter: Mutex::new(limiter),
+            audit: None,
         }
+    }
+
+    /// Records every authorized read through `audit`.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AccessAudit>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Handles a read for `shard_hex` with `token` at `now_ms` (Unix milliseconds).
@@ -149,6 +173,9 @@ impl<R: RecordSource> Gateway<R> {
         signer.authorize(token, &shard, Scope::Read, now_ms / 1000)?;
         drop(signer);
 
+        if let Some(audit) = &self.audit {
+            audit.authorized(Scope::Read, token, &shard, now_ms / 1000)?;
+        }
         let record = self.source.fetch(&shard)?;
         Ok(record
             .field_names()
@@ -268,6 +295,39 @@ mod tests {
             source,
             RateLimiter::new(limit, 1, 100).expect("limiter"),
         )
+    }
+
+    struct RefusingAudit;
+
+    impl AccessAudit for RefusingAudit {
+        fn authorized(&self, _: Scope, _: &str, _: &ShardKey, _: u64) -> Result<(), ShatterError> {
+            Err(ShatterError::Internal)
+        }
+    }
+
+    #[test]
+    fn a_read_the_audit_cannot_record_is_refused_before_the_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let s = signer();
+        let token = issue(&s, read_scope(), NOW_MS / 1000);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetches);
+        let source = move |shard: &ShardKey| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            record_source(shard)
+        };
+        let gw = Gateway::new(
+            Arc::clone(&s),
+            source,
+            RateLimiter::new(10, 1, 100).expect("limiter"),
+        )
+        .with_audit(Arc::new(RefusingAudit));
+
+        let resp = gw.read(&token, &shard_hex(), NOW_MS);
+        assert_eq!(resp.status, 500, "{resp:?}");
+        assert!(resp.fields.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
     }
 
     #[test]

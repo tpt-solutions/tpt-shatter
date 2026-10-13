@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-gateway"
-description = "tpt-shatter: gateway crate (scaffold)."
+description = "Token-checked, rate-limited read and write gateway for tpt-shatter, served over HTTP/1.1 with TLS 1.3 and optional mTLS."
+readme = "README.md"
+repository.workspace = true
+keywords = ["http", "tls", "rate-limiting", "rustls", "capability"]
+categories = ["network-programming", "web-programming::http-server"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

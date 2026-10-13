@@ -899,6 +899,7 @@ dependencies = [
  "tpt-shatter-assembler",
  "tpt-shatter-canary",
  "tpt-shatter-common",
+ "tpt-shatter-emitter",
  "tpt-shatter-gateway",
  "tpt-shatter-shredder",
  "tpt-shatter-token",

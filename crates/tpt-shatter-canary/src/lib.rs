@@ -12,10 +12,8 @@
 //! due. [`Alarm::record`] writes a detection to the security alert log, which is the
 //! notification channel.
 //!
-//! Not implemented yet: a timer loop that calls [`refresh_canaries`], in-band detection
-//! in the vault client (the planned replacement for query-log tailing, now that the
-//! vaults are internal), and
-//! realistic record generation (values are structured but not realistic).
+//! Canary values are shaped by field name (see [`values`]), so a canary record looks like
+//! a real one to someone who reads a vault.
 
 use std::collections::HashMap;
 
@@ -29,6 +27,7 @@ use zeroize::Zeroizing;
 mod inject;
 mod monitor;
 mod rotation;
+mod values;
 mod watch;
 
 pub use inject::refresh_canaries;
@@ -39,6 +38,7 @@ pub use watch::CanaryWatch;
 const SHARD_DOMAIN: &[u8] = b"tpt-shatter/canary/shard/v1";
 const PREFIX_DOMAIN: &[u8] = b"tpt-shatter/canary/prefix/v1";
 const EPOCH_DOMAIN: &[u8] = b"tpt-shatter/canary/epoch/v1";
+const VALUE_DOMAIN: &[u8] = b"tpt-shatter/canary/value/v1";
 
 /// Describes the canaries to inject: count, shard keys, and value prefix.
 ///
@@ -105,16 +105,21 @@ impl CanaryPlan {
         Ok(ShardKey::from_bytes(digest))
     }
 
-    /// The canary record for `index`, with a value in every schema field.
+    /// The canary record for `index`, with a realistic value in every schema field.
     ///
-    /// Each value starts with the secret prefix, so a canary record is recognizable only to
-    /// someone holding the canary key.
+    /// Each value is derived from the canary key, the index, and the field name, so only
+    /// holders of the canary key can reproduce it. The shape follows the field name; see
+    /// [`values::canary_value`].
     pub fn record(&self, schema: &ShatterSchema, index: usize) -> Result<Record, ShatterError> {
-        let prefix = self.prefix()?;
         let mut record = Record::new();
         for vault in VaultId::ALL {
             for field in schema.fields_for(vault) {
-                record.insert(field, format!("{prefix}-{index:06}"));
+                let seed = keyed_digest(
+                    &self.canary_key[..],
+                    VALUE_DOMAIN,
+                    format!("{index}/{field}").as_bytes(),
+                )?;
+                record.insert(field, values::canary_value(field, &seed));
             }
         }
         Ok(record)
@@ -405,13 +410,28 @@ mod tests {
     }
 
     #[test]
-    fn canary_record_fills_every_field_with_the_prefix() {
+    fn canary_record_fills_every_field_with_a_shaped_value() {
         let p = plan(2);
         let r = p.record(&schema(), 1).expect("record");
-        let prefix = p.prefix().expect("prefix");
-        for name in ["name", "birth_year", "card_number"] {
-            assert!(r.get(name).expect("field").starts_with(&prefix));
-        }
+        assert_eq!(r.len(), 3);
+        assert!(r.get("name").expect("name").contains(' '));
+        let year: u32 = r.get("birth_year").expect("year").parse().expect("number");
+        assert!((1940..=2005).contains(&year));
+        assert_eq!(r.get("card_number").expect("card").len(), 16);
+    }
+
+    #[test]
+    fn canary_values_depend_on_the_canary_key_and_index() {
+        let p = plan(2);
+        let other_key = CanaryPlan::new([0xEE; 32], DERIVATION_KEY, 2).expect("other");
+        let a = p.record(&schema(), 0).expect("record");
+        let b = p.record(&schema(), 1).expect("record");
+        let c = other_key.record(&schema(), 0).expect("record");
+        assert_ne!(a.get("name"), b.get("name"));
+        assert_ne!(a.get("name"), c.get("name"));
+        // Same key and index always give the same record.
+        let again = p.record(&schema(), 0).expect("record");
+        assert_eq!(a.get("card_number"), again.get("card_number"));
     }
 
     #[test]

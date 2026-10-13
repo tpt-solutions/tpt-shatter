@@ -22,7 +22,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] (Historical, keystone dropped) Review tpt-keystone-db Rust API / wire protocol; choose native API vs wire client
 - [x] (Historical, keystone dropped) Confirm keystone supports SCRAM-SHA-256 + TLS as the spec assumes (supported but opt-in; deployment config must enable it)
 - [-] (Superseded: keystone dropped.) Confirm keystone exposes a query log / audit hook the canary can tail; if not, file/implement the feature upstream — PARTIAL: audit log is table `_mirror_audit`, readable by polling; no stream; query text capture unverified (UPSTREAM.md)
-- [ ] Review tpt-strata embedding API (in-process ingest, group by, sum) and its durability model — PARTIAL: `Table`/`QueryBuilder` found; group-by/sum names and durability not documented upstream (UPSTREAM.md); decided JSONL is the durable copy (DECISIONS.md)
+- [x] Review tpt-strata embedding API (in-process ingest, group by, sum) and its durability model — checked against the pinned source: `QueryBuilder::group_by` and `aggregate` (Sum, Count) exist; strata does no file or network I/O, so JSONL is the durable copy (UPSTREAM.md, DECISIONS.md)
 - [x] Confirm tpt-strata never needs a separate server process
 
 ### Open gaps from spec section 10 (design decisions)
@@ -55,13 +55,12 @@ Resolve these before the implementation phases that depend on them.
 - [x] Add `NOTICE` file
 - [x] Add license section to `README.md`
 - [x] Add SPDX headers convention (`MIT OR Apache-2.0`) and enforce it
-- [x] Rename/move `spec.txt` -> `DESIGN.md` (markdown table reflow still pending, tracked separately)
 - [x] Create `.gitignore`, `rust-toolchain.toml`, `rustfmt.toml`, clippy config
 - [x] Scaffold 9 crates under `crates/`: common, token, gateway, shredder, assembler, emitter, canary, anonymize, vault-client
 - [x] Scaffold directories: `vaults/vault-frag-{a,b,c}`, `insight-vault/`, `infrastructure/{terraform,k8s,policies}`, `tests/{integration,canary}`
 - [x] Add `deny.toml` (cargo-deny) that rejects Apache-only licenses and bans unwanted crates
 - [x] Add GitHub Actions CI: fmt, clippy, test, cargo-deny, cargo-audit
-- [x] Add `CONTRIBUTING.md` stating contributions are dual-licensed MIT OR Apache-2.0
+- [x] Add `CONTRIBUTING.md` (contributions by issue only; no pull requests accepted)
 - [ ] Set up `cargo-deny` license check as a required CI gate
 - [x] Add `SECURITY.md` (disclosure process)
 - [ ] Add workspace-wide lint rules (partial: `unsafe` denied and `dbg!` denied; sensitive-type logging lint still pending)
@@ -157,7 +156,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Zero all memory on completion and on every error path — PARTIAL: buffers are Zeroizing; memory-level verification pending
 - [ ] `mlock` / `mlockall` usage with CAP_IPC_LOCK; fail closed if unavailable — PARTIAL: pending; needs Linux host
 - [ ] Disable core dumps (`RLIMIT_CORE=0`, `PR_SET_DUMPABLE`) — PARTIAL: pending; needs Linux host
-- [ ] Per-request timeout; abort cleanly and zero on cancellation — PARTIAL: pending
+- [ ] Per-request timeout; abort cleanly and zero on cancellation — PARTIAL: `assemble_with_deadline` returns `VaultUnavailable` at the deadline and drops late bodies. A vault call still running is not cancelled, and it finishes in the background; the timeout is not yet wired into the node read path
 - [x] Handle missing/partial fragments safely (no partial record returned)
 - [ ] Internal gRPC (tonic) interface for the gateway, with mTLS — PARTIAL: pending: needs tonic and mTLS
 - [ ] Statically linked build (musl) with no shell — PARTIAL: pending; needs musl toolchain
@@ -169,14 +168,15 @@ Resolve these before the implementation phases that depend on them.
 ## Phase 8 — `tpt-shatter-emitter` & `insight-vault`
 - [x] Apply anonymization transforms (bucket, pseudonymize, noise)
 - [x] k-anonymity gate before emit
-- [ ] Emit to embedded tpt-strata engine — PARTIAL: `EventSink` trait, `MemorySink`, and durable `JsonlSink` (fsynced, read-back) done; strata adapter pending upstream API confirmation
+- [x] Emit to embedded tpt-strata engine — `StrataSink` (`strata.rs`): durable timestamped JSONL first, then the in-memory strata view. Rebuilt from the log on open. `count_by` and `sum_by` are tested, including an empty view and a field no event holds. Node feed wired: accepted writes are anonymized at ingest, held, and emitted once the k-anonymity gate passes (`analytics.rs`, tested)
+- [x] Analytics retention: events are purged from the log and the view after `retention_secs` (`purge_before`, tested; node purge tested with the same window as vault fragments). Decided in DECISIONS.md
 - [x] Signal assembler to zero record after emit
-- [ ] `insight-vault/` setup: strata storage layout and schema for anonymized events — PARTIAL: pending
+- [ ] `insight-vault/` setup: strata storage layout and schema for anonymized events — PARTIAL: the feed writes `state_dir/analytics.jsonl` (timestamped, policy-approved fields only). `insight-vault/` is still an empty directory and is not used; deciding whether it should hold that file is part of deployment (Phase 12)
 - [x] Decide embedded vs sidecar deployment for strata (embedded, DECISIONS.md)
 - [x] Decide on tpt-strata-parquet bridge: dropped (Apache-only deps; banned in deny.toml)
-- [ ] Sample aggregation queries (sum, group by) for BI access
+- [ ] Sample aggregation queries (sum, group by) for BI access — PARTIAL: `StrataSink::count_by` and `sum_by` exist; no BI-facing access path yet (next item)
 - [ ] Analytics subnet access path for BI tools (emitter-only inbound)
-- [ ] Tests: no raw PII present in strata output — PARTIAL: verified against MemorySink; re-run on strata
+- [x] Tests: no raw PII present in strata output — the log and both strata views (count and sum) are checked for raw name, card, and SSN values, and the bucketed year must appear (`the_log_and_the_strata_views_hold_no_raw_identifiers`)
 - [x] Docs + license headers
 
 ---
@@ -198,7 +198,7 @@ Resolve these before the implementation phases that depend on them.
 ---
 
 ## Phase 10 — `tpt-shatter-canary`
-- [ ] Canary record generator (synthetic high-value records, realistic-looking) — PARTIAL: structured records, not yet realistic
+- [ ] Canary record generator (synthetic high-value records, realistic-looking) — PARTIAL: values are shaped by field name (`canary::values`): Luhn-valid card numbers, dates, names, test-range emails and phones, opaque IDs otherwise. Shapes come from name keywords because the schema has no field types; a schema type field would replace that
 - [x] Secret deterministic prefix scheme
 - [x] Periodic injection into all vaults: `refresh_canaries` writes the current epoch through the shredder and erases the previous one, in that order, and is idempotent (tested); `monitor_loop` in `tpt-shatter-node/src/main.rs` calls it each `monitor_interval_secs`
 - [x] Canary refresh/rotation schedule: `CanaryRotation` gives the current epoch's plan, `refresh_canaries` applies it (tested), `canary_period_secs` in node config (default 7 days), and `monitor_loop` runs it on a timer
@@ -222,8 +222,8 @@ Resolve these before the implementation phases that depend on them.
 
 ### Audit trail
 - [x] Define audit event schema (who/what/when via token hash and shard hash, no payload)
-- [ ] Implement tamper-evident audit log (hash chain) — PARTIAL: keyed HMAC chain with verify/resume in common (in-memory); durable storage and export pending
-- [ ] Compliance export/report tooling
+- [ ] Implement tamper-evident audit log (hash chain) — PARTIAL: keyed HMAC chain in common; durable, verified-on-open log (`AuditStore`, node) records issue, ingest, read, and alarm events. Gateway and writer record each authorized operation before it runs, and fail closed if the append fails (tested). Alarms record the vault only, with zero digests. Erasure is not written: `shredder::erase` has no node entry point yet, so there is nothing to hook
+- [ ] Compliance export/report tooling — PARTIAL: `audit::report` and `AuditReport::to_json` summarize a verified chain (counts, bounds, head MAC, no digests); no CLI or scheduled export
 
 ### Disaster recovery
 - [ ] Backup/restore runbook per vault
@@ -232,7 +232,7 @@ Resolve these before the implementation phases that depend on them.
 
 ### Schema evolution
 - [x] Schema version stored with fragments (4-byte header on every fragment; assembler refuses a mismatch, tested)
-- [ ] Re-shatter migration tool (read via assembler, write via shredder, verify, retire old)
+- [ ] Re-shatter migration tool (read via assembler, write via shredder, verify, retire old) — PARTIAL: `migrate_shard` (assembler crate) reads each fragment under its own version, writes without the shredder's compensating delete, verifies through the assembler, and resumes after a failed write. Old fragments are retired by overwrite. No batch driver or CLI; field moves are supported, field removal is refused
 
 ### Key provisioning
 - [ ] Bootstrap mechanism for HMAC / derivation keys (RAM-only delivery)

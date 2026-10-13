@@ -27,7 +27,14 @@ time of checking. Re-verify and replace them with tags before any release.
   Compatible with our policy. The GitHub API's Apache-2.0 label is incomplete.
 - Deployment: embeddable, in-process, with no server process. The README reports zero
   external dependencies for the core crate. Confirmed.
-- **Not yet verified:** the builder API for ingest, group-by, and sum, and the durability model.
+- API (verified in the pinned source, `crates/tpt-strata/src`): `Column::new` and
+  `Table::try_new` build a table from values. `QueryBuilder::new(&table).group_by(..)
+  .aggregate(col, AggFunc::{Sum, Count, Min, Max, Avg}).execute()` returns a grouped table.
+  `Table::empty(schema)` returns a typed empty table. An all-NULL column cannot be built,
+  because the type cannot be inferred.
+- **Durability: none.** The crate has no file or network I/O (`std::fs`, `File`, and
+  serialization are absent from `src`). Tables live in memory, and the emitter's JSONL log
+  is the only durable copy (see `StrataSink`).
 
 ## tpt-strata-parquet (optional Parquet import bridge)
 
@@ -60,13 +67,10 @@ time of checking. Re-verify and replace them with tags before any release.
   Whether it captures query text is still open.
 
 ### tpt-strata API and durability
-- Embedding types: `Table` and `Column` (`format.rs`) build tables from Rust data;
-  `QueryBuilder` (`query.rs`) is a consuming builder. The group-by and sum method names
-  aren't in the docs.
-- **Durability: not documented.** `spec.txt` and `ARCHITECTURE.md` describe an
-  in-memory, native columnar engine with pull-based operators that fully materialize
-  their output. They say nothing about persistence, write path, flush, or recovery.
-  Parquet is import-only.
-- Consequence: strata cannot be the durable copy of anonymized events. See the
-  `JsonlSink` decision in `DECISIONS.md`.
-- Checklist status: API partly known, durability open with the upstream owner.
+- Checked against the cached source at the pinned rev `0439970` (cargo git checkout). The
+  API and durability questions are now answered; see the strata section above.
+- Consequence: strata cannot be the durable copy of anonymized events. The emitter's
+  `StrataSink` writes every event to the fsynced JSONL log first, then keeps a copy in
+  memory for strata queries. On restart it rebuilds the view from the log.
+- Open with the upstream owner: none for shatter's use. Strata's view is unbounded in
+  memory, since nothing evicts events from it.

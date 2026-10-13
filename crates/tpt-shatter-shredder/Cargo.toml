@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-shredder"
-description = "tpt-shatter: shredder crate (scaffold)."
+description = "Splits records into per-vault fragments with compensating rollback, GDPR erasure, and a background orphan reaper for tpt-shatter."
+readme = "README.md"
+repository.workspace = true
+keywords = ["data-fragmentation", "gdpr-erasure", "sharding", "orphan-reaper", "data-security"]
+categories = ["cryptography", "filesystem"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

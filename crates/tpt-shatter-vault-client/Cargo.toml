@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-vault-client"
-description = "tpt-shatter: vault-client crate (scaffold)."
+description = "Client for tpt-shatter's isolated vaults: keyed fragment IDs, a per-vault router with circuit breakers, and encrypted file storage with retention."
+readme = "README.md"
+repository.workspace = true
+keywords = ["vault", "encryption", "chacha20poly1305", "circuit-breaker", "fragment-storage"]
+categories = ["cryptography", "filesystem"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

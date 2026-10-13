@@ -177,7 +177,7 @@ pub struct IssueOutcome {
 pub struct Issuer {
     signer: Arc<RwLock<Signer>>,
     callers: Vec<Caller>,
-    audit: AuditStore,
+    audit: Arc<AuditStore>,
 }
 
 impl Issuer {
@@ -186,7 +186,7 @@ impl Issuer {
     pub fn new(
         signer: Arc<RwLock<Signer>>,
         config: &IssuerConfig,
-        audit: AuditStore,
+        audit: Arc<AuditStore>,
     ) -> Result<Self, ShatterError> {
         let callers = config
             .callers
@@ -534,7 +534,7 @@ mod tests {
     fn issuer_at(path: &Path) -> Issuer {
         let signer = Arc::new(RwLock::new(Signer::new(1, [0x5E; 32])));
         let audit = AuditStore::open(path, KEY).expect("audit");
-        Issuer::new(signer, &config(), audit).expect("issuer")
+        Issuer::new(signer, &config(), Arc::new(audit)).expect("issuer")
     }
 
     fn body(shard: &str, scopes: &[&str], ttl: Option<u64>) -> Vec<u8> {

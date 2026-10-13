@@ -21,6 +21,7 @@ pub use http::{AccessLog, BreakerProbe, HttpConfig, Shared, WriteHandler, serve,
 pub use ingest::{RecordSink, Writer};
 pub use ratelimit::RateLimiter;
 pub use service::{
-    AlarmResponder, Gateway, RecordSource, Response, SigningKeyRotator, public_error, ready,
+    AccessAudit, AlarmResponder, Gateway, RecordSource, Response, SigningKeyRotator, public_error,
+    ready,
 };
 pub use tls::{acceptor, server_config};

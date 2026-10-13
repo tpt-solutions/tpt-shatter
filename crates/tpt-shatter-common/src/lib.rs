@@ -20,7 +20,10 @@ mod vault;
 mod zero;
 
 pub use alert::AlertLog;
-pub use audit::{AUDIT_DIGEST_LEN, AuditAction, AuditChain, AuditEvent, AuditRecord, verify_chain};
+pub use audit::{
+    AUDIT_DIGEST_LEN, AuditAction, AuditChain, AuditEvent, AuditRecord, AuditReport, report,
+    verify_chain,
+};
 pub use error::ShatterError;
 pub use fragment_id::{FRAGMENT_ID_LEN, FragmentId};
 pub use payload::FragmentPayload;

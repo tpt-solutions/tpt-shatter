@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-emitter"
-description = "tpt-shatter: emitter crate (scaffold)."
+description = "Anonymizes reconstructed records under a per-field policy, enforces a k-anonymity gate, and emits to JSON-lines or analytics sinks for tpt-shatter."
+readme = "README.md"
+repository.workspace = true
+keywords = ["analytics", "anonymization", "k-anonymity", "jsonl", "privacy"]
+categories = ["database", "algorithms"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,12 +1,14 @@
 # Contributing to tpt-shatter
 
-Thanks for helping. Please read [DESIGN.md](DESIGN.md) first; it is the source of truth for the architecture.
+Contributions are by issue only. Please open an issue to report a bug, ask a question, or propose a change. Pull requests and code patches are not accepted.
 
-## Licensing of contributions
+Read [DESIGN.md](DESIGN.md) first; it is the source of truth for the architecture. The project is licensed under the MIT License or the Apache License, Version 2.0, as in [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
-Unless you state otherwise, any contribution you submit is dual-licensed under
-the MIT License and the Apache License, Version 2.0, as in [LICENSE-MIT](LICENSE-MIT)
-and [LICENSE-APACHE](LICENSE-APACHE), without any additional terms or conditions.
+## Issue guidelines
+
+- Describe the problem or proposal, and the behavior you expected.
+- Do not include payloads, fragments, FragmentIds, shard keys, tokens, or user identifiers in an issue. Use synthetic data.
+- Report security vulnerabilities through [SECURITY.md](SECURITY.md), not a public issue.
 
 ## Dependency policy
 
@@ -24,15 +26,6 @@ Every Rust source file starts with:
 ```
 
 CI fails if a `.rs` file is missing this header.
-
-## Before opening a pull request
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo deny check
-```
 
 ## Sensitive data rules
 

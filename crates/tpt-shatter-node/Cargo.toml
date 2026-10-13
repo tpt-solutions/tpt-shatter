@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-node"
-description = "tpt-shatter: the node process that wires the vault store, router, canary, gateway, and background work."
+description = "The tpt-shatter node: wires the vaults, router, canaries, gateway, token issuer, and background work into one service."
+readme = "README.md"
+repository.workspace = true
+keywords = ["data-security", "gateway", "token-issuer", "vault", "daemon"]
+categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,6 +32,7 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "macros",
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tpt-shatter-assembler = { version = "0.1.0", path = "../tpt-shatter-assembler" }
 tpt-shatter-canary = { version = "0.1.0", path = "../tpt-shatter-canary" }
+tpt-shatter-emitter = { version = "0.1.0", path = "../tpt-shatter-emitter" }
 tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
 tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
 tpt-shatter-shredder = { version = "0.1.0", path = "../tpt-shatter-shredder" }

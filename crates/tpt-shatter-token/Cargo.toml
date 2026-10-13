@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-token"
-description = "tpt-shatter: token crate (scaffold)."
+description = "Stateless HMAC-SHA256 capability tokens for tpt-shatter, with short TTLs, shard binding, scopes, and key rotation."
+readme = "README.md"
+repository.workspace = true
+keywords = ["capability-token", "hmac", "access-control", "bearer-token", "zeroize"]
+categories = ["cryptography", "web-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

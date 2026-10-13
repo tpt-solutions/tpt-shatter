@@ -12,6 +12,8 @@
 //! two caller-supplied 32-byte digests (token and shard). Callers must pass keyed
 //! digests, never raw tokens or shard keys.
 
+use std::collections::BTreeMap;
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -44,6 +46,19 @@ pub enum AuditAction {
 }
 
 impl AuditAction {
+    /// Stable lowercase name, used in reports.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::Read => "read",
+            Self::Erasure => "erasure",
+            Self::Alarm => "alarm",
+            Self::KeyRotation => "key_rotation",
+            Self::Issue => "issue",
+        }
+    }
+
     const fn code(self) -> u8 {
         match self {
             Self::Ingest => 1,
@@ -222,6 +237,75 @@ pub fn verify_chain(key: [u8; 32], records: &[AuditRecord]) -> Result<(), Shatte
         prev = record.mac;
     }
     Ok(())
+}
+
+/// Counts and bounds over a verified chain, for compliance review.
+///
+/// Holds no token or shard digests, so it can be filed or sent without the chain.
+/// Build it with [`report`], and call [`AuditReport::to_json`] to export it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditReport {
+    /// Number of records in the chain.
+    pub records: u64,
+    /// Count per action name, in name order.
+    pub by_action: BTreeMap<&'static str, u64>,
+    /// Count per vault label for events that name a vault, in label order.
+    pub by_vault: BTreeMap<char, u64>,
+    /// Time of the first and last event (Unix seconds), or `None` for an empty chain.
+    pub time_range: Option<(u64, u64)>,
+    /// Hex MAC of the last record. It commits to the whole chain, so an exported report
+    /// can be compared with a later one to show the log only grew.
+    pub head_mac: Option<String>,
+}
+
+impl AuditReport {
+    /// The report as one JSON object.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let vaults: BTreeMap<String, u64> = self
+            .by_vault
+            .iter()
+            .map(|(label, count)| (label.to_string(), *count))
+            .collect();
+        serde_json::json!({
+            "records": self.records,
+            "by_action": self.by_action,
+            "by_vault": vaults,
+            "first_at": self.time_range.map(|(first, _)| first),
+            "last_at": self.time_range.map(|(_, last)| last),
+            "head_mac": self.head_mac,
+        })
+        .to_string()
+    }
+}
+
+/// Verifies `records` under `key`, then summarizes them.
+///
+/// A chain that fails verification returns an error and no report, so a report always
+/// describes a chain that checks out.
+pub fn report(key: [u8; 32], records: &[AuditRecord]) -> Result<AuditReport, ShatterError> {
+    verify_chain(key, records)?;
+    let mut by_action: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut by_vault: BTreeMap<char, u64> = BTreeMap::new();
+    for record in records {
+        let event = &record.event;
+        *by_action.entry(event.action.name()).or_default() += 1;
+        if let Some(vault) = event.vault {
+            *by_vault.entry(vault.label()).or_default() += 1;
+        }
+    }
+    let time_range = records
+        .iter()
+        .map(|r| r.event.at)
+        .min()
+        .zip(records.iter().map(|r| r.event.at).max());
+    Ok(AuditReport {
+        records: u64::try_from(records.len()).map_err(|_| ShatterError::Internal)?,
+        by_action,
+        by_vault,
+        time_range,
+        head_mac: records.last().map(|r| hex_encode(&r.mac)),
+    })
 }
 
 fn mac_for(
@@ -412,6 +496,41 @@ mod tests {
         let mut records = sample_chain();
         records[2].event.at = 0;
         assert!(AuditChain::resume(KEY, &records).is_err());
+    }
+
+    #[test]
+    fn report_counts_actions_and_vaults_over_a_verified_chain() {
+        let summary = report(KEY, &sample_chain()).expect("report");
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.by_action.get("ingest"), Some(&1));
+        assert_eq!(summary.by_action.get("read"), Some(&1));
+        assert_eq!(summary.by_action.get("alarm"), Some(&1));
+        assert_eq!(summary.by_vault.get(&'B'), Some(&3));
+        assert_eq!(summary.time_range, Some((10, 12)));
+        assert_eq!(summary.head_mac.as_ref().map(String::len), Some(64));
+    }
+
+    #[test]
+    fn report_refuses_a_chain_that_does_not_verify() {
+        let mut records = sample_chain();
+        records[1].event.at = 999;
+        assert_eq!(report(KEY, &records), Err(ShatterError::Internal));
+    }
+
+    #[test]
+    fn empty_chain_reports_zero_records_and_no_bounds() {
+        let summary = report(KEY, &[]).expect("report");
+        assert_eq!(summary.records, 0);
+        assert_eq!(summary.time_range, None);
+        assert_eq!(summary.head_mac, None);
+        assert!(summary.to_json().contains("\"records\":0"));
+    }
+
+    #[test]
+    fn report_json_holds_no_digests() {
+        let json = report(KEY, &sample_chain()).expect("report").to_json();
+        assert!(!json.contains(&hex_encode(&[1; AUDIT_DIGEST_LEN])));
+        assert!(!json.contains(&hex_encode(&[2; AUDIT_DIGEST_LEN])));
     }
 
     #[test]

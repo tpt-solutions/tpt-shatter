@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-common"
-description = "tpt-shatter: common crate (scaffold)."
+description = "Shared types, errors, schemas, audit chain, and zeroizing helpers for tpt-shatter, a fragmented data-security architecture."
+readme = "README.md"
+repository.workspace = true
+keywords = ["data-security", "fragmentation", "zeroize", "audit-log", "privacy"]
+categories = ["cryptography", "data-structures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

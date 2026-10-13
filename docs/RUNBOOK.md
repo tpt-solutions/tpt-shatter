@@ -16,7 +16,7 @@ automated. Review this runbook before any deployment.
   by default. The binary refuses to start without TLS settings.
 - Keys come from the environment, as 64 hex characters each: `TPT_KEY_VAULT_A`,
   `TPT_KEY_VAULT_B`, `TPT_KEY_VAULT_C`, `TPT_KEY_DERIVATION`, `TPT_KEY_TOKEN`,
-  `TPT_KEY_CANARY_MASTER`, `TPT_KEY_AUDIT`. The binary names the variable that failed and never prints a
+  `TPT_KEY_CANARY_MASTER`, `TPT_KEY_AUDIT`, `TPT_KEY_ANALYTICS`. The binary names the variable that failed and never prints a
   value. **GAP:** environment keys are an interim source; a secret store is not wired.
 - On start, the node writes the current epoch's canaries into the vaults and records the
   epoch in `state_dir/canary_epoch`. Each monitor pass refreshes canaries when the epoch

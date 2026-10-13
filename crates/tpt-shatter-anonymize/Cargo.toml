@@ -3,7 +3,11 @@
 
 [package]
 name = "tpt-shatter-anonymize"
-description = "tpt-shatter: anonymize crate (scaffold)."
+description = "Anonymization primitives for tpt-shatter: range bucketing, salted pseudonyms, Laplace noise, k-anonymity gate, and display masking."
+readme = "README.md"
+repository.workspace = true
+keywords = ["anonymization", "pseudonymization", "k-anonymity", "differential-privacy", "privacy"]
+categories = ["cryptography", "algorithms"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
