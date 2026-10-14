@@ -14,3 +14,4 @@ All notable changes to `tpt-shatter-node` are documented here. The format follow
 - Token issuer (`Issuer`, `serve_issuer`): per-caller secret digests, scope and TTL policy, `delete` never issuable, and issuance recorded in the audit chain before the token is returned.
 - `AuditStore`: a keyed, hash-chained audit file covering issuances, reads, writes, and canary alarms.
 - Node-level tests that write a record through the node and read it back through the gateway, and that check logs and alerts for secrets.
+- `RemoteVaults::server_names` (optional `VaultServerNames`): one certificate name per vault service, for deployments where each vault runs under its own name. A partial map is refused. Without it, `server_name` applies to all three vaults, as before.

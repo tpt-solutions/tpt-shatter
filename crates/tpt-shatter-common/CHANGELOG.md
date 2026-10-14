@@ -19,7 +19,12 @@ All notable changes to `tpt-shatter-common` are documented here. The format foll
 - `FragmentPayload`, a zeroized vault-and-bytes pair.
 - `SecureZero` trait for in-place zeroing.
 - `ShatterError`, the workspace-wide error type with coarse, non-revealing variants.
+- `ShatterError::ServiceUnavailable`: a service this one depends on could not be reached or did not answer. The gateway maps it to `503`.
+
 
 ### Notes
 - The crate is internal to the workspace and is not published (`publish = false`).
 - Keys are supplied by callers. This crate does not generate or store them.
+
+### Changed
+- `Alarm` (a detected canary: vault and index, never a value) and the `Responder` trait moved here from `tpt-shatter-canary`, with `Alarm::record`.

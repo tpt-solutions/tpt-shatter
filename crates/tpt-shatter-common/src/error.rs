@@ -47,6 +47,10 @@ pub enum ShatterError {
     /// A caller exceeded its request budget.
     #[error("rate limited")]
     RateLimited,
+    /// A service this one depends on, such as the assembler, could not be reached or did not
+    /// answer in time.
+    #[error("service unavailable")]
+    ServiceUnavailable,
     /// An unexpected internal failure.
     #[error("internal error")]
     Internal,

@@ -15,6 +15,10 @@ All notable changes to `tpt-shatter-gateway` are documented here. The format fol
 - TLS 1.3 configuration (`server_config`, `acceptor`) with optional mutual TLS, using the graviola provider.
 - `RateLimiter`, a bounded token bucket keyed by digest, failing closed when full.
 - `SigningKeyRotator` and `AlarmResponder`, connecting canary alarms to key rotation and security notification.
+- `RemoteAssembler`, a `RecordSource` that asks the assembler service for each record over mTLS, with a connect and I/O timeout. A peer that closes without answering is `ServiceUnavailable`.
+- `remote` module: `client_config`, and the shared wire format (`encode_record`, `decode_record`, `encode_error`, `decode_error`) that the assembler service uses.
+
 
 ### Changed
 - The gRPC transport was dropped in favor of HTTP/1.1. See `DECISIONS.md`.
+- No longer depends on `tpt-shatter-canary`. `AlarmResponder` implements `Responder` from `tpt-shatter-common`, so the gateway no longer reaches the vault client through canary.

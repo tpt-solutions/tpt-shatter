@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "tpt-shatter-assembler-service"
+description = "The assembler served over mTLS, so the gateway can run on its own host. Holds the derivation key and the vault clients, and returns reassembled records to the gateway only."
+readme = "README.md"
+repository.workspace = true
+keywords = ["assembler", "mtls", "fragments", "rustls", "isolation"]
+categories = ["network-programming", "cryptography"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+# Nothing in this workspace is published to crates.io.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tpt-shatter-assembler"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tpt-shatter-assembler = { version = "0.1.0", path = "../tpt-shatter-assembler" }
+tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
+tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
+tpt-shatter-vault-client = { version = "0.1.0", path = "../tpt-shatter-vault-client" }
+tpt-shatter-vault-service = { version = "0.1.0", path = "../tpt-shatter-vault-service" }
+
+[dev-dependencies]
+tpt-shatter-shredder = { version = "0.1.0", path = "../tpt-shatter-shredder" }

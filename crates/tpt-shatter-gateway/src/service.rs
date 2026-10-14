@@ -5,8 +5,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
-use tpt_shatter_canary::{Alarm, Responder};
-use tpt_shatter_common::{CALLER_TAG_LEN, Record, Scope, ShardKey, ShatterError};
+use tpt_shatter_common::{Alarm, CALLER_TAG_LEN, Record, Responder, Scope, ShardKey, ShatterError};
 use tpt_shatter_token::Signer;
 
 use crate::ratelimit::RateLimiter;
@@ -78,7 +77,9 @@ pub const fn public_error(error: ShatterError) -> (u16, &'static str) {
         | ShatterError::InvalidSchema => (400, "bad_request"),
         ShatterError::Reconstruction => (404, "not_found"),
         ShatterError::RateLimited => (429, "rate_limited"),
-        ShatterError::VaultUnavailable { .. } => (503, "unavailable"),
+        ShatterError::VaultUnavailable { .. } | ShatterError::ServiceUnavailable => {
+            (503, "unavailable")
+        }
         _ => (500, "internal"),
     }
 }

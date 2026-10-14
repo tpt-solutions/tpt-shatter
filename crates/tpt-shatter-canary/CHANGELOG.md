@@ -15,3 +15,6 @@ All notable changes to `tpt-shatter-canary` are documented here. The format foll
 - `CanaryMonitor`: drains the watch, runs the gate, and writes alarms to the alert log.
 - `Responder` trait for the two response steps: signing-key rotation and security notification.
 - `values::canary_value`: field-shaped canary values, including Luhn-valid card numbers and `.invalid` email domains.
+
+### Changed
+- `Alarm` and `Responder` are re-exported from `tpt-shatter-common`, where they now live. Existing paths still compile.

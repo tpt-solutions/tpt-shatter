@@ -158,7 +158,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Disable core dumps (`RLIMIT_CORE=0`, `PR_SET_DUMPABLE`) — PARTIAL: pending; needs Linux host
 - [ ] Per-request timeout; abort cleanly and zero on cancellation — PARTIAL: the node read path uses `assemble_with_deadline` with a 3 s `READ_DEADLINE`, shorter than the 5 s HTTP timeout, so a stalled read returns `503` and frees its blocking thread. A vault call still running is not cancelled; it finishes in the background and its late body is dropped
 - [x] Handle missing/partial fragments safely (no partial record returned)
-- [ ] Internal gRPC (tonic) interface for the gateway, with mTLS — PARTIAL: pending: needs tonic and mTLS
+- [ ] Internal gRPC (tonic) interface for the gateway, with mTLS — PARTIAL: HTTP/JSON over mTLS is built (`tpt-shatter-assembler-service`, client `RemoteAssembler`); gRPC was not adopted (see DECISIONS.md)
 - [ ] Statically linked build (musl) with no shell — PARTIAL: pending; needs musl toolchain
 - [ ] Memory-safety tests (see Phase 13) — PARTIAL: pending (see Phase 13)
 - [x] Docs + license headers
@@ -185,13 +185,13 @@ Resolve these before the implementation phases that depend on them.
 - [x] HTTP/JSON server — hyper 1 (MIT) in `crates/tpt-shatter-gateway/src/http.rs`; axum avoided because it pulls sync_wrapper (Apache-only). TLS is separate (below)
 - [x] Capability token validation (HMAC, TTL, scope)
 - [x] Rate limiting (per token hash / per source) — per token hash in `Gateway::read`; per source IP (digest of the peer address, port excluded) on `/v1/records` in `http.rs`, refused with 429 before the token check; tested. Not set by default: deployment must pass a `source_limiter`
-- [ ] Route validated requests to the assembler (gRPC, mTLS) — PARTIAL: in-process RecordSource trait done; transport decided as HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md); assembler client and mTLS pending
+- [ ] Route validated requests to the assembler (gRPC, mTLS) — PARTIAL: `RemoteAssembler` (gateway) and `tpt-shatter-assembler-service` (served over mTLS, with end-to-end tests) are built. Transport is HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md). Still open: the gateway has no standalone binary yet, and canary alarms are not observed in the assembler service
 - [x] Return responses; uniform error responses that leak nothing
 - [x] Logs only token hashes and metadata
 - [x] Key rotation signal receiver (from canary) with instant effect
 - [x] Health/readiness endpoints — `/healthz` and `/readyz` in `http.rs`, tested
 - [x] TLS termination config — `serve_tls` (TLS 1.3, optional mTLS) built on rustls 0.23 + rustls-graviola 0.2.1, tested with real handshakes (`tests/tls.rs`); cert issuance and rotation pending
-- [ ] Verify the gateway has no network path to any vault — PARTIAL: gateway has no direct vault-client dependency, but it reaches vault-client transitively through `tpt-shatter-canary` (`cargo tree -p tpt-shatter-gateway -i tpt-shatter-vault-client`). Code-level separation needs the canary dependency removed or split; network isolation is infrastructure work
+- [ ] Verify the gateway has no network path to any vault — PARTIAL: code-level separation done. The gateway no longer depends on canary, so its dependency tree has no vault-client, assembler, or shredder (`cargo tree -p tpt-shatter-gateway`). Network isolation is infrastructure work
 - [ ] Request size limits, timeouts, header hardening — PARTIAL: request-head size limit and per-request timeout done in `http.rs` (tested); body limits not needed for GET; no-store and nosniff headers set
 - [x] Docs + license headers
 
@@ -250,25 +250,25 @@ Resolve these before the implementation phases that depend on them.
 
 ## Phase 12 — Infrastructure
 ### Terraform (cloud-agnostic)
-- [ ] Network segments: DMZ, private (assembler/shredder), vault subnets (isolated), management, analytics
-- [ ] Security groups / firewall rules per spec section 6.1 table
-- [ ] Vault subnets isolated from each other
-- [ ] Storage for vault backups (per-vault buckets/credentials)
-- [ ] Secret management wiring
+- [ ] Network segments: DMZ, private (assembler/shredder), vault subnets (isolated), management, analytics — NOT STARTED: Terraform resources are provider-specific, so this needs a target cloud. Segment inputs are in `infrastructure/README.md`
+- [ ] Security groups / firewall rules per spec section 6.1 table — NOT STARTED (the in-cluster equivalent is in `infrastructure/k8s/network-policies.yaml`)
+- [ ] Vault subnets isolated from each other — PARTIAL: isolated by NetworkPolicy in `infrastructure/k8s`; no network-level isolation yet
+- [ ] Storage for vault backups (per-vault buckets/credentials) — NOT STARTED
+- [ ] Secret management wiring — NOT STARTED
 
-### Kubernetes
-- [ ] Manifests for each service, distroless images
-- [ ] Assembler: tmpfs root, no persistent volumes, swap disabled, `CAP_IPC_LOCK`, read-only root fs
-- [ ] NetworkPolicies matching the isolation table
-- [ ] Pod security: non-root, drop all caps (except required), seccomp
-- [ ] mTLS between internal services (cert provisioning) — PARTIAL: mTLS listener built and tested (gateway `serve_tls` with client CA); provisioning and rotation pending
-- [ ] Vault StatefulSets with separate namespaces/nodes
+### Kubernetes (`infrastructure/k8s/`, applied as plain manifests; not run on a cluster)
+- [ ] Manifests for each service, distroless images — PARTIAL: node and vault workloads written; image digests are placeholders and no distroless build exists yet
+- [ ] Assembler: tmpfs root, no persistent volumes, swap disabled, `CAP_IPC_LOCK`, read-only root fs — PARTIAL: read-only root fs, memory-backed keys and scratch volumes, dropped caps. One PVC (`tpt-node-state`) is kept for node state, against spec 6.2; swap and `CAP_IPC_LOCK` not set (decision needed, see `infrastructure/README.md` gap 2)
+- [x] NetworkPolicies matching the isolation table — PARTIAL-DONE: default-deny per namespace; vault accepts node only and has no egress. Gateway-in-DMZ separation is not possible while the node is one process (gap 1). Needs an enforcing CNI to take effect
+- [ ] Pod security: non-root, drop all caps (except required), seccomp — PARTIAL: all set in the manifests and checked by OPA; not verified on a cluster
+- [ ] mTLS between internal services (cert provisioning) — PARTIAL: mTLS listener built and tested; the manifests reference the Secrets, which nothing creates yet
+- [x] Vault StatefulSets with separate namespaces/nodes — PARTIAL-DONE: one StatefulSet per vault namespace, each with its own volume. Node placement is not set
 - [ ] Container build pipeline (static musl Rust binaries, no shell/curl)
 
-### Policies
-- [ ] OPA policies: admission rules (tmpfs, no hostPath, no privileged, image allow-list)
-- [ ] OPA/network policies: cross-vault traffic denied
-- [ ] Policy tests
+### Policies (`infrastructure/policies/`)
+- [x] OPA policies: admission rules (tmpfs, no hostPath, no privileged, image allow-list) — PARTIAL-DONE: rules written; the image allow-list is a placeholder default; tested with `opa test` (16/16). Not run as a live admission webhook
+- [ ] OPA/network policies: cross-vault traffic denied — PARTIAL: each NetworkPolicy is checked as it arrives. Cannot prove a default-deny exists in each vault namespace without cluster-wide data (Gatekeeper sync)
+- [x] Policy tests — 16 `opa test` cases pass, and the shipped manifests pass the rules
 
 ---
 

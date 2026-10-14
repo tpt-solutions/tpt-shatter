@@ -102,14 +102,31 @@ pub struct RemoteVaults {
     pub b: String,
     /// `host:port` of vault C's service.
     pub c: String,
-    /// Name the services' certificates must carry, for example `vault.internal`.
+    /// Name the services' certificates must carry, for example `vault.internal`. Used for
+    /// every vault unless `server_names` is set.
     pub server_name: String,
+    /// Per-vault certificate names. Set this when each service runs under its own name, as
+    /// in separate namespaces. When set, it replaces `server_name` for every vault.
+    #[serde(default)]
+    pub server_names: Option<VaultServerNames>,
     /// CA that the services' certificates must chain to (PEM).
     pub ca: PathBuf,
     /// This node's client certificate (PEM).
     pub client_cert: PathBuf,
     /// This node's client private key (PEM).
     pub client_key: PathBuf,
+}
+
+/// The certificate name each remote vault service must present.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultServerNames {
+    /// Name for vault A's service certificate.
+    pub a: String,
+    /// Name for vault B's service certificate.
+    pub b: String,
+    /// Name for vault C's service certificate.
+    pub c: String,
 }
 
 /// Where each vault keeps its files.
@@ -436,12 +453,19 @@ impl Node {
         let mut vaults = Vec::with_capacity(3);
         if let Some(remote) = &config.remote_vaults {
             let tls = client_tls_from_files(&remote.ca, &remote.client_cert, &remote.client_key)?;
-            for (vault, addr) in [
+            let names = match &remote.server_names {
+                Some(n) => [n.a.clone(), n.b.clone(), n.c.clone()],
+                None => std::array::from_fn(|_| remote.server_name.clone()),
+            };
+            for ((vault, addr), name) in [
                 (VaultId::A, &remote.a),
                 (VaultId::B, &remote.b),
                 (VaultId::C, &remote.c),
-            ] {
-                let backend = RemoteVault::new(vault, addr, &remote.server_name, Arc::clone(&tls))?;
+            ]
+            .into_iter()
+            .zip(names)
+            {
+                let backend = RemoteVault::new(vault, addr, &name, Arc::clone(&tls))?;
                 guards.push(Guarded::new(
                     Box::new(backend),
                     BreakerConfig::default(),
@@ -1646,6 +1670,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_vaults_take_a_name_per_vault_when_given_one() {
+        let shared: RemoteVaults = serde_json::from_str(
+            r#"{"a":"x:1","b":"y:1","c":"z:1","server_name":"vault.internal",
+                "ca":"ca","client_cert":"c","client_key":"k"}"#,
+        )
+        .expect("shared name");
+        assert!(shared.server_names.is_none());
+
+        let per_vault: RemoteVaults = serde_json::from_str(
+            r#"{"a":"x:1","b":"y:1","c":"z:1","server_name":"unused",
+                "server_names":{"a":"a.internal","b":"b.internal","c":"c.internal"},
+                "ca":"ca","client_cert":"c","client_key":"k"}"#,
+        )
+        .expect("per-vault names");
+        let names = per_vault.server_names.expect("names");
+        assert_eq!(
+            (names.a, names.b, names.c),
+            (
+                "a.internal".to_owned(),
+                "b.internal".to_owned(),
+                "c.internal".to_owned()
+            )
+        );
+
+        let partial = serde_json::from_str::<RemoteVaults>(
+            r#"{"a":"x:1","b":"y:1","c":"z:1","server_name":"n",
+                "server_names":{"a":"a.internal"},
+                "ca":"ca","client_cert":"c","client_key":"k"}"#,
+        );
+        assert!(partial.is_err(), "a partial name map is refused");
+    }
+
+    #[test]
     fn a_record_round_trips_through_three_remote_vault_services() {
         use std::net::TcpListener;
         use tpt_shatter_vault_client::FileVault;
@@ -1684,6 +1741,7 @@ mod tests {
             b: addresses[1].clone(),
             c: addresses[2].clone(),
             server_name: "localhost".to_owned(),
+            server_names: None,
             ca: fixture("ca.pem"),
             client_cert: fixture("client.pem"),
             client_key: fixture("client.key"),

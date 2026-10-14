@@ -17,7 +17,10 @@
 
 use std::collections::HashMap;
 
-use tpt_shatter_common::AlertLog;
+
+/// Re-exported from `tpt-shatter-common`, so the gateway can respond to alarms without
+/// depending on this crate.
+pub use tpt_shatter_common::{Alarm, Responder};
 use tpt_shatter_common::{
     FragmentId, Record, SHARD_KEY_LEN, ShardKey, ShatterError, ShatterSchema, VaultId,
 };
@@ -136,36 +139,6 @@ pub const fn epoch_at(now: u64, period_secs: u64) -> Result<u64, ShatterError> {
     Ok(now / period_secs)
 }
 
-/// One canary found in a query.
-///
-/// The alarm holds only the vault and canary index. It never holds the FragmentId or
-/// any canary value, so it is safe to log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Alarm {
-    /// The vault that was queried.
-    pub vault: VaultId,
-    /// Which canary was touched.
-    pub index: usize,
-}
-
-impl Alarm {
-    /// Writes this alarm to the security alert log at time `at` (Unix seconds).
-    ///
-    /// Only the vault label and canary index are written. A responder calls this from
-    /// [`Responder::notify_security`] to implement the notification channel.
-    pub fn record(&self, log: &AlertLog, at: u64) -> Result<(), ShatterError> {
-        let index = self.index.to_string();
-        log.append(
-            "canary_alarm",
-            at,
-            &[
-                ("vault", &self.vault.label().to_string()),
-                ("index", &index),
-            ],
-        )
-    }
-}
-
 /// Recognizes canary FragmentIds among queried IDs.
 pub struct Detector {
     index: HashMap<(VaultId, [u8; SHARD_KEY_LEN]), usize>,
@@ -204,14 +177,6 @@ impl Detector {
             })
             .collect()
     }
-}
-
-/// The side effects an alarm triggers.
-pub trait Responder {
-    /// Rotates the token signing key, invalidating every outstanding token.
-    fn rotate_signing_key(&self) -> Result<(), ShatterError>;
-    /// Sends one alarm to security. The alarm carries no canary values.
-    fn notify_security(&self, alarm: &Alarm) -> Result<(), ShatterError>;
 }
 
 /// What an [`AlarmGate::handle`] call did.
@@ -307,7 +272,7 @@ impl AlarmGate {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use tpt_shatter_common::SHARD_KEY_LEN;
+    use tpt_shatter_common::{AlertLog, SHARD_KEY_LEN};
 
     const CANARY_KEY: [u8; 32] = [0xC1; 32];
     const DERIVATION_KEY: [u8; 32] = [0xD2; 32];

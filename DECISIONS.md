@@ -353,3 +353,45 @@ that is said. Changing a decision means editing this file and the checklist toge
 - **Key files for vault services.** Each vault service reads its key from a file of 64 hex
   characters, refused unless it is mode 0400 or 0600 on Unix, and it never reads the node's
   keys.
+
+## Kubernetes layout and per-vault names (2026-10-15)
+
+- **Per-vault certificate names.** Each vault service runs in its own namespace, so its
+  certificate carries its own name. `RemoteVaults` takes an optional `server_names` map,
+  one name per vault. Without it, `server_name` applies to all three vaults, as before.
+  Partial maps are refused.
+- **One node process, one pod.** The node runs the gateway, assembler, shredder, canary,
+  issuer, and analytics feed in one process, so the spec 6.1 gateway-in-DMZ separation is
+  not expressible yet. The manifests put the whole node in a private namespace, with an
+  edge rule that reaches it on the read port only. Splitting the gateway from the node
+  needs the canary dependency removed from the gateway crate.
+- **Node state on disk (exception to spec 6.2).** The audit chain, the orphan queue, and
+  the analytics log live in `state_dir`, which needs persistent storage. The manifests
+  allow one PVC for it, and the OPA rules allow only that claim on the node. This is a
+  deliberate exception, pending a decision on where that state should live. Remove the
+  exception when that decision is made.
+- **Policies as code.** Admission rules and NetworkPolicy rules are written in Rego under
+  `infrastructure/policies/`, with unit tests run by `opa test`. They are a starting point,
+  not yet run as a live admission webhook. See `infrastructure/README.md`.
+
+## Assembler service and the gateway link (2026-10-15)
+
+- **Transport: HTTP/1.1 over mTLS, not gRPC.** The gateway calls the assembler the same way
+  it calls the vault services: one request per connection, TLS 1.3, client certificate
+  required. The record crosses this link as `{"fields": {...}}`. Errors cross as a code,
+  plus the vault label where one applies.
+- **Alarm types moved to common.** `Alarm` and the `Responder` trait live in
+  `tpt-shatter-common`, and canary re-exports them. The gateway implements its responder
+  without depending on canary. That dependency reached the vault client, so the gateway's
+  tree no longer contains vault, assembler, or shredder crates.
+- **`ServiceUnavailable`.** A new error for a service this one depends on that cannot be
+  reached or does not answer. The gateway maps it to `503`, the same as a vault outage.
+- **Open: canary in the split.** The assembler service does not attach the router observer,
+  so a canary read that goes through it raises no alarm. The alarm response also rotates
+  the gateway's token key, which cannot reach a gateway on another host yet. Until that
+  propagation exists, the canary observer must stay where the alarm response can reach the
+  gateway. Do not split the node without deciding this.
+- **Open: read audit in the split.** The gateway records each authorized read in the audit
+  chain, which is keyed by `TPT_KEY_AUDIT`. A gateway host would need that key, or the
+  audit writes would need to move. This needs a decision before a standalone gateway
+  binary is built.

@@ -924,6 +924,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpt-shatter-assembler-service"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "serde",
+ "serde_json",
+ "tpt-shatter-assembler",
+ "tpt-shatter-common",
+ "tpt-shatter-gateway",
+ "tpt-shatter-shredder",
+ "tpt-shatter-vault-client",
+ "tpt-shatter-vault-service",
+]
+
+[[package]]
 name = "tpt-shatter-canary"
 version = "0.1.0"
 dependencies = [
@@ -971,7 +986,6 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-rustls",
- "tpt-shatter-canary",
  "tpt-shatter-common",
  "tpt-shatter-token",
 ]

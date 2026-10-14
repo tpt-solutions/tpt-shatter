@@ -13,6 +13,7 @@
 
 mod http;
 mod ingest;
+pub mod remote;
 mod ratelimit;
 mod service;
 mod tls;
@@ -20,6 +21,7 @@ mod tls;
 pub use http::{AccessLog, BreakerProbe, HttpConfig, Shared, WriteHandler, serve, serve_tls};
 pub use ingest::{RecordSink, Writer};
 pub use ratelimit::RateLimiter;
+pub use remote::RemoteAssembler;
 pub use service::{
     AccessAudit, AlarmResponder, Gateway, RecordSource, Response, SigningKeyRotator, public_error,
     ready,

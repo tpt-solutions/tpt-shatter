@@ -6,6 +6,7 @@
 //! This crate contains no business logic. Sensitive types here never implement
 //! `Clone` or a revealing `Debug`, and their `Debug` output is redacted.
 
+mod alarm;
 mod alert;
 mod audit;
 mod error;
@@ -19,6 +20,7 @@ mod token;
 mod vault;
 mod zero;
 
+pub use alarm::{Alarm, Responder};
 pub use alert::AlertLog;
 pub use audit::{
     AUDIT_DIGEST_LEN, AuditAction, AuditChain, AuditEvent, AuditRecord, AuditReport, report,
