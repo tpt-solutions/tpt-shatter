@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+#
+# One namespace per network segment in spec section 6.1. Every namespace enforces the
+# Kubernetes "restricted" Pod Security Standard. The tpt.solutions/* labels are what the
+# NetworkPolicies in network-policies.yaml and the OPA rules in ../policies select on.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shatter-edge
+  labels:
+    tpt.solutions/segment: dmz
+    tpt.solutions/role: edge-ingress
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shatter-node
+  labels:
+    tpt.solutions/segment: private
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault-a
+  labels:
+    tpt.solutions/segment: vault
+    tpt.solutions/vault: "A"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault-b
+  labels:
+    tpt.solutions/segment: vault
+    tpt.solutions/vault: "B"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault-c
+  labels:
+    tpt.solutions/segment: vault
+    tpt.solutions/vault: "C"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: management
+  labels:
+    tpt.solutions/segment: management
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

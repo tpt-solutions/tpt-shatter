@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+#
+# Implements the spec section 6.1 isolation matrix for the parts that are deployed here.
+# Every namespace starts from default-deny. Each rule below is one allowed flow.
+#
+# Requires a CNI that enforces NetworkPolicy (for example Calico or Cilium).
+# Without one, these objects are accepted and silently do nothing.
+#
+# Known gap: the node binary runs the gateway, assembler, shredder, canary, issuer, and
+# emitter in one process, so the spec's gateway-in-DMZ separation cannot be expressed
+# yet. The edge rule below reaches the whole node. See README.md.
+---
+# ---- vault-a / vault-b / vault-c: accept only the node; send nothing -----------------
+# Vaults never reach each other: no rule in one vault namespace allows another.
+# Vault egress is empty, so a vault cannot open any outbound connection.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-default-deny
+  namespace: vault-a
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-accept-node
+  namespace: vault-a
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tpt-shatter-vault
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shatter-node
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tpt-shatter-node
+      ports:
+        - protocol: TCP
+          port: 7443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-default-deny
+  namespace: vault-b
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-accept-node
+  namespace: vault-b
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tpt-shatter-vault
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shatter-node
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tpt-shatter-node
+      ports:
+        - protocol: TCP
+          port: 7443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-default-deny
+  namespace: vault-c
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-accept-node
+  namespace: vault-c
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tpt-shatter-vault
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shatter-node
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tpt-shatter-node
+      ports:
+        - protocol: TCP
+          port: 7443
+---
+# ---- shatter-node: the private node -------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-default-deny
+  namespace: shatter-node
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-ingress
+  namespace: shatter-node
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tpt-shatter-node
+  policyTypes: ["Ingress"]
+  ingress:
+    # Gateway reads and ingestion writes, from the edge ingress only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tpt.solutions/role: edge-ingress
+      ports:
+        - protocol: TCP
+          port: 8443
+    # Token issuer, from the namespaces that host the calling applications. Label each
+    # such namespace tpt.solutions/role=issuer-client.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tpt.solutions/role: issuer-client
+      ports:
+        - protocol: TCP
+          port: 8444
+    # Metrics, from the management namespace only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tpt.solutions/segment: management
+      ports:
+        - protocol: TCP
+          port: 9100
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-egress
+  namespace: shatter-node
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tpt-shatter-node
+  policyTypes: ["Egress"]
+  egress:
+    # The three vault services, and nothing else.
+    - to:
+        - namespaceSelector:
+            matchExpressions:
+              - key: tpt.solutions/segment
+                operator: In
+                values: ["vault"]
+      ports:
+        - protocol: TCP
+          port: 7443
+    # Cluster DNS, so the vault service names resolve.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# ---- shatter-edge: the only way in from outside -------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edge-default-deny
+  namespace: shatter-edge
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edge-egress-to-node
+  namespace: shatter-edge
+spec:
+  podSelector:
+    matchLabels:
+      tpt.solutions/role: edge-ingress
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shatter-node
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tpt-shatter-node
+      ports:
+        - protocol: TCP
+          port: 8443
+---
+# ---- management: scrapes metrics, nothing else --------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: management-default-deny
+  namespace: management
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: management-scrape-node
+  namespace: management
+spec:
+  podSelector:
+    matchLabels:
+      tpt.solutions/role: metrics-scraper
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shatter-node
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tpt-shatter-node
+      ports:
+        - protocol: TCP
+          port: 9100
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

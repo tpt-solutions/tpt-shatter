@@ -1,0 +1,227 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+#
+# The tpt-shatter-node workload: gateway, assembler, shredder, canary, issuer, and the
+# analytics feed, in one process. Runs in the private shatter-node namespace.
+#
+# Secrets referenced here are created out of band. Nothing in this directory creates
+# certificates or keys. See README.md for what is still missing.
+#
+# The schema below is a placeholder taken from the node example. Replace it with the
+# deployment's real shatter schema before use.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tpt-node-config
+  namespace: shatter-node
+  labels:
+    app.kubernetes.io/name: tpt-shatter-node
+data:
+  node.json: |
+    {
+      "listen": "0.0.0.0:8443",
+      "tls_cert": "/etc/tpt/tls/tls.crt",
+      "tls_key": "/etc/tpt/tls/tls.key",
+      "client_ca": "/etc/tpt/client-ca/ca.pem",
+      "schema": "/etc/tpt/schema/schema.json",
+      "state_dir": "/var/lib/tpt/state",
+      "remote_vaults": {
+        "a": "vault.vault-a.svc.cluster.local:7443",
+        "b": "vault.vault-b.svc.cluster.local:7443",
+        "c": "vault.vault-c.svc.cluster.local:7443",
+        "server_name": "vault.internal",
+        "server_names": {
+          "a": "vault.vault-a.svc.cluster.local",
+          "b": "vault.vault-b.svc.cluster.local",
+          "c": "vault.vault-c.svc.cluster.local"
+        },
+        "ca": "/etc/tpt/vault-client/ca.pem",
+        "client_cert": "/etc/tpt/vault-client/client.pem",
+        "client_key": "/etc/tpt/vault-client/client.key"
+      },
+      "canary_count": 8,
+      "canary_period_secs": 604800,
+      "alarm_cooldown_secs": 3600,
+      "reap_interval_secs": 60,
+      "reap_max_attempts": 10,
+      "monitor_interval_secs": 60,
+      "retention_secs": 1209600,
+      "purge_interval_secs": 3600,
+      "issuer": {
+        "listen": "0.0.0.0:8444",
+        "callers": []
+      },
+      "metrics_listen": "0.0.0.0:9100"
+    }
+  schema.json: |
+    {
+      "version": 1,
+      "fields": { "name": "A", "birth_year": "B", "card_number": "C" }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tpt-node-state
+  namespace: shatter-node
+  labels:
+    app.kubernetes.io/name: tpt-shatter-node
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tpt-node
+  namespace: shatter-node
+  labels:
+    app.kubernetes.io/name: tpt-shatter-node
+spec:
+  # One replica only. The state directory has one writer (audit chain, orphan queue,
+  # analytics log), and two nodes on one state volume would corrupt it.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tpt-shatter-node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tpt-shatter-node
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: node
+          # Pin by digest. The OPA rules reject unpinned images and images outside the
+          # allow-list. Replace the placeholder with the built image's digest.
+          image: registry.example.internal/tpt-shatter/node@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["/etc/tpt/node.json"]
+          env:
+            # Keys are read from this tmpfs directory, one file per key. The directory is
+            # filled out of band by the custody ceremony (see docs/RUNBOOK.md).
+            - name: TPT_KEYS_DIR
+              value: /run/tpt-keys
+          ports:
+            - name: gateway
+              containerPort: 8443
+            - name: issuer
+              containerPort: 8444
+            - name: metrics
+              containerPort: 9100
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: gateway
+              scheme: HTTPS
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+              scheme: HTTPS
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tpt
+              readOnly: true
+            - name: schema
+              mountPath: /etc/tpt/schema
+              readOnly: true
+            - name: tls
+              mountPath: /etc/tpt/tls
+              readOnly: true
+            - name: client-ca
+              mountPath: /etc/tpt/client-ca
+              readOnly: true
+            - name: vault-client
+              mountPath: /etc/tpt/vault-client
+              readOnly: true
+            - name: keys
+              mountPath: /run/tpt-keys
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/tpt/state
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: tpt-node-config
+            items:
+              - key: node.json
+                path: node.json
+        - name: schema
+          configMap:
+            name: tpt-node-config
+            items:
+              - key: schema.json
+                path: schema.json
+        - name: tls
+          secret:
+            secretName: tpt-node-tls
+            defaultMode: 0400
+        - name: client-ca
+          secret:
+            secretName: tpt-gateway-client-ca
+            defaultMode: 0400
+        - name: vault-client
+          secret:
+            secretName: tpt-node-vault-client
+            defaultMode: 0400
+        # Key material lives only in RAM. Sized to hold the eight 64-character key files.
+        - name: keys
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: state
+          persistentVolumeClaim:
+            claimName: tpt-node-state
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tpt-node
+  namespace: shatter-node
+  labels:
+    app.kubernetes.io/name: tpt-shatter-node
+spec:
+  selector:
+    app.kubernetes.io/name: tpt-shatter-node
+  ports:
+    - name: gateway
+      port: 8443
+      targetPort: gateway
+    - name: issuer
+      port: 8444
+      targetPort: issuer
+    - name: metrics
+      port: 9100
+      targetPort: metrics
