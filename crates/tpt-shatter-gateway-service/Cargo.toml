@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "tpt-shatter-gateway-service"
+description = "The public read path as its own process: token checks, rate limits, and read auditing, with records fetched from the assembler service over mTLS. Holds no vault client and no derivation key."
+readme = "README.md"
+repository.workspace = true
+keywords = ["gateway", "mtls", "capability", "rustls", "isolation"]
+categories = ["network-programming", "cryptography"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+# Nothing in this workspace is published to crates.io.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tpt-shatter-gateway"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
+tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
+tpt-shatter-token = { version = "0.1.0", path = "../tpt-shatter-token" }
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tpt-shatter-assembler-service = { version = "0.1.0", path = "../tpt-shatter-assembler-service" }
+tpt-shatter-shredder = { version = "0.1.0", path = "../tpt-shatter-shredder" }
+tpt-shatter-vault-client = { version = "0.1.0", path = "../tpt-shatter-vault-client" }
+tpt-shatter-vault-service = { version = "0.1.0", path = "../tpt-shatter-vault-service" }

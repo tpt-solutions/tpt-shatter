@@ -20,6 +20,9 @@ All notable changes to `tpt-shatter-common` are documented here. The format foll
 - `SecureZero` trait for in-place zeroing.
 - `ShatterError`, the workspace-wide error type with coarse, non-revealing variants.
 - `ShatterError::ServiceUnavailable`: a service this one depends on could not be reached or did not answer. The gateway maps it to `503`.
+- `AuditStore`, the file-backed audit chain, moved here from `tpt-shatter-node` so the gateway service can keep its own chain. It verifies on open and syncs each record.
+- `keyed_digest`, moved here from `tpt-shatter-vault-client`. It is still re-exported there.
+- `read_key_file`, moved here from `tpt-shatter-vault-service`, with the same permission checks. It is still re-exported there.
 
 
 ### Notes

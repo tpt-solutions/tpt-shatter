@@ -45,12 +45,13 @@ The policies are meant to run as an OPA or Gatekeeper validating webhook.
    assembler in a private subnet, which cannot be expressed with one pod. The current
    `shatter-edge` rule reaches the whole node.
 
-   Progress: the gateway's code no longer depends on canary, so its dependency tree has no
-   vault, assembler, or shredder crates. The assembler can run as its own service
-   (`tpt-shatter-assembler-service`), reached over mTLS with `RemoteAssembler`, and that link
-   is tested end to end. Still open: a standalone gateway binary, the canary observer in
-   the split, and read auditing from a gateway host. DECISIONS.md, "Assembler service",
-   records both open items. Do not split the node until they are decided.
+   Progress: the gateway is its own binary (`tpt-shatter-gateway-service`). It has no vault,
+   assembler, shredder, or canary crates in its normal dependency tree. It reads records from
+   the assembler service over mTLS, and records reads on its own audit chain under its own key.
+   It refuses to start unless `acknowledge_canary_gap` is set, because canary alarms do not
+   revoke its tokens yet (DECISIONS.md, "Gateway service"). Not deployed: this directory has
+   no gateway or assembler workload yet. Add them to the private and edge namespaces once
+   alarm propagation is decided.
 
 2. **Spec 6.2 forbids persistent volumes on the assembler host, but the node needs disk.**
    The audit chain, the orphan queue, and the analytics log live in `state_dir`. The

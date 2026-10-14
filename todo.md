@@ -185,13 +185,13 @@ Resolve these before the implementation phases that depend on them.
 - [x] HTTP/JSON server — hyper 1 (MIT) in `crates/tpt-shatter-gateway/src/http.rs`; axum avoided because it pulls sync_wrapper (Apache-only). TLS is separate (below)
 - [x] Capability token validation (HMAC, TTL, scope)
 - [x] Rate limiting (per token hash / per source) — per token hash in `Gateway::read`; per source IP (digest of the peer address, port excluded) on `/v1/records` in `http.rs`, refused with 429 before the token check; tested. Not set by default: deployment must pass a `source_limiter`
-- [ ] Route validated requests to the assembler (gRPC, mTLS) — PARTIAL: `RemoteAssembler` (gateway) and `tpt-shatter-assembler-service` (served over mTLS, with end-to-end tests) are built. Transport is HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md). Still open: the gateway has no standalone binary yet, and canary alarms are not observed in the assembler service
+- [x] Route validated requests to the assembler (gRPC, mTLS) — DONE over HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md): `RemoteAssembler` (gateway) and `tpt-shatter-assembler-service` (mTLS, end-to-end tests). Canary alarm propagation to a split gateway is still open (DECISIONS.md, gateway service)
 - [x] Return responses; uniform error responses that leak nothing
 - [x] Logs only token hashes and metadata
 - [x] Key rotation signal receiver (from canary) with instant effect
 - [x] Health/readiness endpoints — `/healthz` and `/readyz` in `http.rs`, tested
 - [x] TLS termination config — `serve_tls` (TLS 1.3, optional mTLS) built on rustls 0.23 + rustls-graviola 0.2.1, tested with real handshakes (`tests/tls.rs`); cert issuance and rotation pending
-- [ ] Verify the gateway has no network path to any vault — PARTIAL: code-level separation done. The gateway no longer depends on canary, so its dependency tree has no vault-client, assembler, or shredder (`cargo tree -p tpt-shatter-gateway`). Network isolation is infrastructure work
+- [ ] Verify the gateway has no network path to any vault — PARTIAL: code-level separation done, and the standalone `tpt-shatter-gateway` binary (`tpt-shatter-gateway-service`) has no vault, assembler, shredder, or canary crates in its normal dependency tree. The gateway no longer depends on canary, so its dependency tree has no vault-client, assembler, or shredder (`cargo tree -p tpt-shatter-gateway`). Network isolation is infrastructure work
 - [ ] Request size limits, timeouts, header hardening — PARTIAL: request-head size limit and per-request timeout done in `http.rs` (tested); body limits not needed for GET; no-store and nosniff headers set
 - [x] Docs + license headers
 

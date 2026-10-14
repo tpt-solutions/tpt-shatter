@@ -14,3 +14,6 @@ All notable changes to `tpt-shatter-vault-client` are documented here. The forma
 - `AccessObserver` hook for observing reads and deletes before they run.
 - `derive_fragment_id` and `keyed_digest`: HMAC-SHA256 fragment addressing with per-vault domain tags.
 - Fragment body codec: `encode_fields`, `decode_fields`, and a 4-byte schema version header.
+
+### Changed
+- `keyed_digest` is re-exported from `tpt-shatter-common`, where it now lives.

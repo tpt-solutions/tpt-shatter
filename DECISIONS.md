@@ -395,3 +395,27 @@ that is said. Changing a decision means editing this file and the checklist toge
   chain, which is keyed by `TPT_KEY_AUDIT`. A gateway host would need that key, or the
   audit writes would need to move. This needs a decision before a standalone gateway
   binary is built.
+
+## Gateway service (2026-10-15): decisions on the two open items
+
+The two open items in "Assembler service and the gateway link" are decided as follows.
+
+- **Read audit uses the gateway's own key and chain.** `tpt-shatter-gateway` writes
+  `gateway-audit.jsonl` under its own `audit_key_file`. It never receives `TPT_KEY_AUDIT`,
+  so compromising the DMZ host does not expose the node's chain. The two chains are checked
+  separately. Verifying across both is an offline step that needs both keys, held by
+  different custodians. Writes are not served by the gateway, so the gateway audits reads
+  only.
+- **Canary alarms are not propagated to the gateway.** The gateway refuses to start unless
+  `acknowledge_canary_gap` is `true`. The node keeps the canary observer, and its response
+  rotates only the node's signing key. Until alarm propagation exists, a canary read does
+  not revoke tokens on a split gateway. The flag records that acceptance in the config
+  itself. Building propagation (alarm to gateway over the management network, then rotation
+  there) is the next step before this split is used in production.
+- **Readiness covers the gateway process only.** Assembler health is not in `/readyz` yet.
+- **Dependency security fix.** `cargo deny check` reported RUSTSEC-2026-0346 through
+  -0349 against rustls 0.23.45. The lockfile now pins rustls 0.23.46, the first fixed
+  release. Only rustls was updated.
+- **Shared code moved to common.** `AuditStore`, `keyed_digest`, and `read_key_file` moved
+  into `tpt-shatter-common`, so the gateway can use them without depending on the node or
+  the vault crates. The old paths re-export them.

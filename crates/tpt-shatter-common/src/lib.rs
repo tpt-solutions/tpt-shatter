@@ -8,6 +8,9 @@
 
 mod alarm;
 mod alert;
+mod audit_store;
+mod digest;
+mod key_file;
 mod audit;
 mod error;
 mod fragment_id;
@@ -21,6 +24,9 @@ mod vault;
 mod zero;
 
 pub use alarm::{Alarm, Responder};
+pub use audit_store::AuditStore;
+pub use digest::keyed_digest;
+pub use key_file::read_key_file;
 pub use alert::AlertLog;
 pub use audit::{
     AUDIT_DIGEST_LEN, AuditAction, AuditChain, AuditEvent, AuditRecord, AuditReport, report,
