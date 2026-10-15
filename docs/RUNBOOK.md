@@ -131,10 +131,18 @@ When the canary detects a canary FragmentId being read through the vault router:
    `CanaryWatch`). A hit means a read or delete through the router, which is the only path
    our services use. Maintenance paths (erasure, rotation, reaping) are not observed by
    design. Direct access to a vault's files on the host is not detected at all.
-   The response runs through `CanaryMonitor::poll`. **GAP:** no service calls `poll` on a
-   timer yet, so a hit is not acted on until one does.
+   The response runs through `CanaryMonitor::poll`, on the node's monitor loop.
 5. **Operator:** re-arm only after the cooldown. `AlarmGate::rearm` refuses to re-arm
    before the cooldown ends. Re-arming is a human decision, not an automatic one.
+6. **Split assembler.** A canary read through `tpt-shatter-assembler` is seen by its own
+   `CanaryWatcher`, not by the node. The first hit locks the assembler, and every read is
+   refused until the assembler is restarted, so the gateway also stops serving reads. The
+   restart is the re-arm step: read the `alert_log` file named in the assembler's config first. The
+   lock does not rotate the token key. **GAP:** the node's canary list
+   (`state_dir/canary-ids.txt`) must be copied to the assembler host by hand. The assembler
+   refuses to start without it. If the list goes stale, the assembler logs
+   `canary_list_stale` and keeps serving, so treat that entry as a node fault: the node has
+   stopped refreshing its canaries.
 
 ## 4. Erasure (GDPR)
 

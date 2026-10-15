@@ -20,6 +20,9 @@ use std::time::Duration;
 
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use tpt_shatter_assembler::assemble_with_deadline;
+
+pub mod canary;
+pub use canary::{CanaryWatcher, LockedSource};
 use tpt_shatter_common::{Record, ShardKey, ShatterError, ShatterSchema};
 use tpt_shatter_gateway::RecordSource;
 use tpt_shatter_gateway::remote::{RECORD_PATH, encode_error, encode_record};

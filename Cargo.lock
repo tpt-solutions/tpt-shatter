@@ -931,6 +931,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tpt-shatter-assembler",
+ "tpt-shatter-canary",
  "tpt-shatter-common",
  "tpt-shatter-gateway",
  "tpt-shatter-shredder",

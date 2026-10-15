@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tpt_shatter_assembler::assemble_with_deadline;
-use tpt_shatter_canary::{Alarm, CanaryMonitor, CanaryRotation, CanaryWatch, refresh_canaries};
+use tpt_shatter_canary::{
+    Alarm, CanaryIds, CanaryMonitor, CanaryRotation, CanaryWatch, refresh_canaries,
+};
 use tpt_shatter_common::{
     AlertLog, AuditRecord, Record, RetentionPolicy, ShardKey, ShatterError, ShatterSchema, VaultId,
     report,
@@ -56,6 +58,8 @@ const AUDIT_LOG: &str = "audit.jsonl";
 const ALERT_LOG: &str = "alerts.jsonl";
 const ANALYTICS_LOG: &str = "analytics.jsonl";
 const CANARY_EPOCH: &str = "canary_epoch";
+/// The current epoch's canary FragmentIds, for a split assembler to watch.
+pub const CANARY_IDS: &str = "canary-ids.txt";
 
 /// The analytics feed. Off unless the config names a policy file.
 #[derive(Debug, Clone, Deserialize)]
@@ -689,6 +693,10 @@ impl Node {
 
     /// Writes the canaries for the epoch containing `now` if they are not there yet, and
     /// erases the previous epoch's. Returns `true` when a refresh happened.
+    ///
+    /// The canary FragmentIds of the current epoch are written to the state directory on
+    /// every call, after any refresh. A split assembler watches that list, so it must follow
+    /// each epoch change.
     pub fn refresh_canaries(&self, now: u64) -> Result<bool, ShatterError> {
         let last = self.load_epoch()?;
         let refreshed = refresh_canaries(
@@ -699,14 +707,17 @@ impl Node {
             last,
             now,
         )?;
-        match refreshed {
+        let changed = match refreshed {
             Some(epoch) => {
                 self.store_epoch(epoch)?;
                 self.watch.replace(&self.rotation.plan_at(now)?)?;
-                Ok(true)
+                true
             }
-            None => Ok(false),
-        }
+            None => false,
+        };
+        let ids = CanaryIds::from_plan(&self.rotation.plan_at(now)?, self.rotation.epoch(now)?)?;
+        ids.write_file(&self.config.state_dir.join(CANARY_IDS))?;
+        Ok(changed)
     }
 
     /// Erases every fragment for `shard` (GDPR erasure). The request is recorded in the audit
@@ -1197,6 +1208,25 @@ mod tests {
         assert_eq!(outcome, tpt_shatter_canary::Outcome::Fired { alarms: 1 });
         // Before the alarm the token is valid, and the shard has no record, so 404.
         assert_eq!(before.status, 404, "{before:?}");
+    }
+
+    #[test]
+    fn the_node_writes_the_current_canary_list_for_the_assembler() {
+        let root = temp_root("canary-list");
+        let node = Node::build(config(&root), keys()).expect("build");
+        let now = now_secs();
+        node.refresh_canaries(now).expect("refresh");
+
+        let path = node.config().state_dir.join(CANARY_IDS);
+        let listed = CanaryIds::read_file(&path);
+        fs::remove_dir_all(&root).expect("cleanup");
+        let listed = listed.expect("list");
+
+        let rotation =
+            CanaryRotation::new(keys().canary_master, keys().derivation, 2, 7 * 24 * 3600)
+                .expect("rotation");
+        assert_eq!(listed.epoch(), rotation.epoch(now).expect("epoch"));
+        assert_eq!(listed.entries().len(), 2 * VaultId::ALL.len());
     }
 
     /// Collects what a subscriber writes, so a test can inspect the log output.

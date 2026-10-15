@@ -8,13 +8,20 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use tpt_shatter_assembler_service::{AssemblerSource, serve};
+use tpt_shatter_assembler_service::canary::Freshness;
+use tpt_shatter_assembler_service::{AssemblerSource, CanaryWatcher, LockedSource, serve};
+use tpt_shatter_canary::{CanaryIds, CanaryWatch};
 use tpt_shatter_common::{ShatterSchema, VaultId};
+use tpt_shatter_gateway::RecordSource;
 use tpt_shatter_gateway::server_config;
-use tpt_shatter_vault_client::{BreakerConfig, Guarded, Router, VaultBackend, system_clock};
+use tpt_shatter_vault_client::{
+    AccessObserver, BreakerConfig, Guarded, Router, VaultBackend, system_clock,
+};
 use tpt_shatter_vault_service::{RemoteVault, client_tls_from_files, read_key_file};
 
 /// The assembler's configuration. Unknown fields are refused.
@@ -23,6 +30,21 @@ use tpt_shatter_vault_service::{RemoteVault, client_tls_from_files, read_key_fil
 struct Config {
     /// Address to listen on, for example `0.0.0.0:7444`.
     listen: String,
+    /// The canary FragmentIds the node writes for the current epoch. Required: the assembler
+    /// refuses to start without a readable list, so it never serves reads unwatched.
+    canary_ids_file: PathBuf,
+    /// The security alert log. Canary alarms and rejected canary lists are appended here.
+    alert_log: PathBuf,
+    /// Seconds between canary passes. Must be positive. Defaults to 30.
+    #[serde(default = "default_monitor_secs")]
+    monitor_interval_secs: u64,
+    /// The node's canary rotation period, in seconds. Must match the node's
+    /// `canary_period_secs`, or the staleness check is wrong.
+    canary_period_secs: u64,
+    /// Seconds past the end of an epoch before its canary list counts as stale. Covers the
+    /// node's pass after a boundary. Defaults to 600.
+    #[serde(default = "default_stale_grace_secs")]
+    canary_stale_grace_secs: u64,
     /// Server certificate chain (PEM).
     tls_cert: PathBuf,
     /// Server private key (PEM).
@@ -77,6 +99,20 @@ fn default_deadline_secs() -> u64 {
     3
 }
 
+fn default_monitor_secs() -> u64 {
+    30
+}
+
+fn default_stale_grace_secs() -> u64 {
+    600
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 fn main() -> ExitCode {
     let Some(path) = std::env::args().nth(1) else {
         eprintln!("usage: tpt-shatter-assembler <config.json>");
@@ -94,14 +130,22 @@ fn main() -> ExitCode {
 fn run(config_path: &Path) -> Result<(), String> {
     let text = fs::read_to_string(config_path).map_err(|_| "config: unreadable".to_owned())?;
     let config: Config = serde_json::from_str(&text).map_err(|e| format!("config: {e}"))?;
-    if config.read_deadline_secs == 0 {
-        return Err("config: read_deadline_secs must be positive".to_owned());
+    if config.read_deadline_secs == 0
+        || config.monitor_interval_secs == 0
+        || config.canary_period_secs == 0
+    {
+        return Err("config: deadlines and intervals must be positive".to_owned());
     }
 
     let schema =
         ShatterSchema::load_json_file(&config.schema).map_err(|_| "schema: refused".to_owned())?;
     let derivation = read_key_file(&config.derivation_key_file)
         .map_err(|_| "derivation key: refused".to_owned())?;
+    // Refuse to start without the canary list, so reads are never served unwatched.
+    let ids = CanaryIds::read_file(&config.canary_ids_file)
+        .map_err(|_| "canary ids: refused".to_owned())?;
+    let watch = Arc::new(CanaryWatch::from_ids(&ids));
+    let locked = Arc::new(AtomicBool::new(false));
 
     let vaults = &config.remote_vaults;
     let client_tls = client_tls_from_files(&vaults.ca, &vaults.client_cert, &vaults.client_key)
@@ -129,14 +173,44 @@ fn run(config_path: &Path) -> Result<(), String> {
             system_clock(),
         ));
     }
-    let router = Arc::new(Router::new(guards).map_err(|_| "router: refused".to_owned())?);
+    // The watch sees every read this router makes, including the ones the assembler makes
+    // for its own reassembly.
+    let observer: Arc<dyn AccessObserver> = Arc::clone(&watch) as Arc<dyn AccessObserver>;
+    let router = Arc::new(
+        Router::new(guards)
+            .map_err(|_| "router: refused".to_owned())?
+            .with_observer(observer),
+    );
 
-    let source = AssemblerSource::new(
+    let inner: Arc<dyn RecordSource> = Arc::new(AssemblerSource::new(
         Arc::new(schema),
         router,
         derivation,
         Duration::from_secs(config.read_deadline_secs),
-    );
+    ));
+    let source = Arc::new(LockedSource::new(inner, Arc::clone(&locked)));
+
+    let mut watcher = CanaryWatcher::new(
+        config.canary_ids_file.clone(),
+        &ids,
+        Arc::clone(&watch),
+        &config.alert_log,
+        Arc::clone(&locked),
+        Freshness {
+            period_secs: config.canary_period_secs,
+            grace_secs: config.canary_stale_grace_secs,
+        },
+    )
+    .map_err(|_| "alert log or canary period: refused".to_owned())?;
+    let interval = Duration::from_secs(config.monitor_interval_secs);
+    thread::spawn(move || {
+        loop {
+            if let Err(e) = watcher.pass(now_secs()) {
+                eprintln!("tpt-shatter-assembler: canary pass: {e}");
+            }
+            thread::sleep(interval);
+        }
+    });
 
     let tls = server_config(
         &fs::read(&config.tls_cert).map_err(|_| "tls_cert: unreadable".to_owned())?,
@@ -146,5 +220,5 @@ fn run(config_path: &Path) -> Result<(), String> {
     .map_err(|_| "tls: refused".to_owned())?;
 
     let listener = TcpListener::bind(&config.listen).map_err(|e| format!("listen: {e}"))?;
-    serve(listener, tls, Arc::new(source)).map_err(|_| "server stopped".to_owned())
+    serve(listener, tls, source).map_err(|_| "server stopped".to_owned())
 }

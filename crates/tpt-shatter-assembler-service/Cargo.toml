@@ -28,6 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tpt-shatter-assembler = { version = "0.1.0", path = "../tpt-shatter-assembler" }
+tpt-shatter-canary = { version = "0.1.0", path = "../tpt-shatter-canary" }
 tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
 tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
 tpt-shatter-vault-client = { version = "0.1.0", path = "../tpt-shatter-vault-client" }

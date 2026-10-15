@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use tpt_shatter_common::{FragmentId, ShatterError, VaultId};
 use tpt_shatter_vault_client::{Access, AccessObserver};
 
-use crate::{Alarm, CanaryPlan, Detector};
+use crate::{Alarm, CanaryIds, CanaryPlan, Detector};
 
 /// Watches observed accesses for the canaries of one epoch.
 pub struct CanaryWatch {
@@ -40,9 +40,26 @@ impl CanaryWatch {
         })
     }
 
+    /// Watches the canaries listed in `ids`. Needs no canary key, so it suits a host that
+    /// only reads canaries.
+    #[must_use]
+    pub fn from_ids(ids: &CanaryIds) -> Self {
+        Self {
+            detector: Mutex::new(Detector::from_entries(ids.entries())),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Switches to the canaries of `plan`, after a rotation. Alarms already queued are kept.
     pub fn replace(&self, plan: &CanaryPlan) -> Result<(), ShatterError> {
         let next = Detector::new(plan)?;
+        *self.detector.lock().map_err(|_| ShatterError::Internal)? = next;
+        Ok(())
+    }
+
+    /// Switches to the canaries listed in `ids`. Alarms already queued are kept.
+    pub fn replace_ids(&self, ids: &CanaryIds) -> Result<(), ShatterError> {
+        let next = Detector::from_entries(ids.entries());
         *self.detector.lock().map_err(|_| ShatterError::Internal)? = next;
         Ok(())
     }

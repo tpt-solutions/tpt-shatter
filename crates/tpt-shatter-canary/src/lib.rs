@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 
-
 /// Re-exported from `tpt-shatter-common`, so the gateway can respond to alarms without
 /// depending on this crate.
 pub use tpt_shatter_common::{Alarm, Responder};
@@ -27,12 +26,14 @@ use tpt_shatter_common::{
 use tpt_shatter_vault_client::{derive_fragment_id, keyed_digest};
 use zeroize::Zeroizing;
 
+mod ids;
 mod inject;
 mod monitor;
 mod rotation;
 mod values;
 mod watch;
 
+pub use ids::CanaryIds;
 pub use inject::refresh_canaries;
 pub use monitor::CanaryMonitor;
 pub use rotation::CanaryRotation;
@@ -87,6 +88,20 @@ impl CanaryPlan {
     #[must_use]
     pub const fn count(&self) -> usize {
         self.count
+    }
+
+    /// Every canary FragmentId as `(vault, canary index, FragmentId)`. Holds no key, so it
+    /// is what a detector needs without the canary key.
+    pub fn fragment_ids(&self) -> Result<Vec<(VaultId, usize, FragmentId)>, ShatterError> {
+        let mut out = Vec::with_capacity(self.count * VaultId::ALL.len());
+        for index in 0..self.count {
+            let shard = self.shard(index)?;
+            for vault in VaultId::ALL {
+                let id = derive_fragment_id(&self.derivation_key[..], &shard, vault)?;
+                out.push((vault, index, id));
+            }
+        }
+        Ok(out)
     }
 
     /// The secret 8-hex-digit prefix that marks every canary value.
@@ -147,15 +162,17 @@ pub struct Detector {
 impl Detector {
     /// Precomputes every canary FragmentId in every vault.
     pub fn new(plan: &CanaryPlan) -> Result<Self, ShatterError> {
-        let mut index = HashMap::with_capacity(plan.count * VaultId::ALL.len());
-        for canary in 0..plan.count {
-            let shard = plan.shard(canary)?;
-            for vault in VaultId::ALL {
-                let id = derive_fragment_id(&plan.derivation_key[..], &shard, vault)?;
-                index.insert((vault, *id.as_bytes()), canary);
-            }
-        }
-        Ok(Self { index })
+        Ok(Self::from_entries(&plan.fragment_ids()?))
+    }
+
+    /// Detects the given canary FragmentIds, as listed by [`CanaryIds`]. Needs no key.
+    #[must_use]
+    pub fn from_entries(entries: &[(VaultId, usize, FragmentId)]) -> Self {
+        let index = entries
+            .iter()
+            .map(|(vault, canary, id)| ((*vault, *id.as_bytes()), *canary))
+            .collect();
+        Self { index }
     }
 
     /// Returns one alarm for each queried ID that matches a canary.

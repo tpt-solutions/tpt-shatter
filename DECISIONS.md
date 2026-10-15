@@ -447,3 +447,38 @@ The two open items in "Assembler service and the gateway link" are decided as fo
     alarm. The node detects canary reads only when the node serves them itself. Attach the
     observer, and give the assembler the canary master key, before the assembler runs on its
     own host.
+
+## Canary detection on the assembler (2026-10-16)
+
+- **No canary key on the assembler host.** The node writes the current epoch's canary
+  FragmentIds to `state_dir/canary-ids.txt` on every monitor pass. The assembler watches
+  that list. A detector needs only the FragmentIds, not the shard keys they came from, so
+  a compromised assembler host cannot derive the other canaries of the epoch.
+- **The list is protected like a key file.** It shows where the canaries are. Writes are
+  atomic and mode 0600 on Unix. Reads refuse group- or other-accessible files. A list that
+  is unreadable, malformed, or from an older epoch than the one held is refused and logged
+  to the alert log, and the held canaries stay in force.
+- **Lock on first alarm.** The gate fires once, sets an in-memory lock, and every read is
+  refused with `ServiceUnavailable` (`503` from the assembler, which the gateway passes
+  through as unavailable). The lock is set from the gate's state, so it holds even if the
+  alert write fails.
+- **Re-arm is a restart.** The gate has no automatic re-arm here. A person reads the alert
+  log, then restarts the assembler. This is stricter than the node, which re-arms after a
+  cooldown. The cooldown is zero here, because it has no effect without a re-arm path.
+- **Why the lock is enough.** Every gateway read calls the assembler. A locked assembler
+  refuses them all, so tokens that remain valid cannot reach data. The lock does not
+  rotate the token key, because the assembler has none. The node's signing key is not
+  changed by an assembler alarm, since the node never sees assembler reads.
+
+**Open, and stated in the runbook:**
+- **The list is not transported.** The node and the assembler are on different hosts, so
+  something must copy `canary-ids.txt` across. Until that is built, the assembler must be
+  pointed at a list kept current by hand, and it refuses to start without one.
+- **A stale list is logged, not locked.** The assembler checks each pass that the held
+  epoch has not run past its end plus a grace period (`canary_stale_grace_secs`, default
+  600). It writes `canary_list_stale` to the alert log once per stale stretch and keeps
+  serving. Locking on staleness would turn a node outage into an assembler outage, and
+  the held canaries still detect reads. The assembler's `canary_period_secs` must match the
+  node's, or the check is wrong.
+- **The lock window is one monitor interval** (30 seconds by default). A canary read
+  returns its record before the lock is set. Shorter intervals narrow the window.
