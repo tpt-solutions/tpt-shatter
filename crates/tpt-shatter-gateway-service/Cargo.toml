@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tpt-shatter-common = { version = "0.1.0", path = "../tpt-shatter-common" }
 tpt-shatter-gateway = { version = "0.1.0", path = "../tpt-shatter-gateway" }
 tpt-shatter-token = { version = "0.1.0", path = "../tpt-shatter-token" }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }

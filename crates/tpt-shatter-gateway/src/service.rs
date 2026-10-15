@@ -2,6 +2,7 @@
 // Copyright (c) 2026 TPT Solutions
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
@@ -9,9 +10,11 @@ use tpt_shatter_common::{Alarm, CALLER_TAG_LEN, Record, Responder, Scope, ShardK
 use tpt_shatter_token::Signer;
 
 use crate::ratelimit::RateLimiter;
+use crate::remote::AlarmPeer;
 
 /// Supplies the next signing key: its version and bytes.
-type NextKey = Box<dyn Fn() -> Result<(u32, [u8; 32]), ShatterError> + Send + Sync>;
+/// Supplies the bytes of the next signing key. The rotator chooses its version.
+pub type NextKey = Box<dyn Fn() -> Result<[u8; 32], ShatterError> + Send + Sync>;
 
 /// Security notification for one alarm.
 type Notify = Box<dyn Fn(&Alarm) -> Result<(), ShatterError> + Send + Sync>;
@@ -187,22 +190,60 @@ impl<R: RecordSource> Gateway<R> {
     }
 }
 
-/// Rotates the signing key. Invoked by the canary responder, which invalidates every
-/// outstanding token at once.
+/// Rotates the signing key here and on every peer gateway. Invoked by the canary responder,
+/// which invalidates every outstanding token at once.
+///
+/// The new key goes to each peer first. This side switches only after every peer has
+/// accepted it, so a failed push leaves the old key in force and the alarm stays armed for a
+/// retry.
 pub struct SigningKeyRotator {
     signer: Arc<RwLock<Signer>>,
     next_key: NextKey,
+    peers: Vec<AlarmPeer>,
+    /// The highest version any attempt has used. Each attempt uses a higher one, so a retry
+    /// after a partial failure is never refused by a peer that took the earlier attempt.
+    attempted: AtomicU32,
 }
 
 impl SigningKeyRotator {
-    /// `next_key` supplies the next key version and bytes. Real provisioning is Phase 11.
+    /// Rotates this side only. `next_key` supplies the new key bytes.
     #[must_use]
     pub fn new(signer: Arc<RwLock<Signer>>, next_key: NextKey) -> Self {
-        Self { signer, next_key }
+        Self::with_peers(signer, next_key, Vec::new())
+    }
+
+    /// Rotates this side and every peer.
+    #[must_use]
+    pub fn with_peers(
+        signer: Arc<RwLock<Signer>>,
+        next_key: NextKey,
+        peers: Vec<AlarmPeer>,
+    ) -> Self {
+        Self {
+            signer,
+            next_key,
+            peers,
+            attempted: AtomicU32::new(0),
+        }
     }
 
     fn rotate(&self) -> Result<(), ShatterError> {
-        let (version, key) = (self.next_key)()?;
+        let key = (self.next_key)()?;
+        let current = self
+            .signer
+            .read()
+            .map_err(|_| ShatterError::Internal)?
+            .key_version();
+        let version = self
+            .attempted
+            .load(Ordering::SeqCst)
+            .max(current)
+            .checked_add(1)
+            .ok_or(ShatterError::Internal)?;
+        self.attempted.store(version, Ordering::SeqCst);
+        for peer in &self.peers {
+            peer.push(version, &key)?;
+        }
         self.signer
             .write()
             .map_err(|_| ShatterError::Internal)?
@@ -450,7 +491,7 @@ mod tests {
         let gw = gateway(&s, 10);
         assert_eq!(gw.read(&token, &shard_hex(), NOW_MS).status, 200);
 
-        let rotator = SigningKeyRotator::new(Arc::clone(&s), Box::new(|| Ok((2, [0xB6; 32]))));
+        let rotator = SigningKeyRotator::new(Arc::clone(&s), Box::new(|| Ok([0xB6; 32])));
         let responder = AlarmResponder::new(rotator, Box::new(|_| Ok(())));
         responder.rotate_signing_key().expect("rotate");
 
@@ -459,12 +500,36 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_peer_push_leaves_the_old_key_in_force() {
+        let s = signer();
+        let ca = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca.pem"
+        ))
+        .expect("ca");
+        let tls = crate::remote::client_config(&ca, None).expect("tls");
+        // Nothing listens on port 1, so the push fails and this side must not switch.
+        let peer = crate::remote::AlarmPeer::new(
+            "127.0.0.1:1",
+            "localhost",
+            tls,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("peer");
+        let rotator =
+            SigningKeyRotator::with_peers(Arc::clone(&s), Box::new(|| Ok([0xD8; 32])), vec![peer]);
+        let responder = AlarmResponder::new(rotator, Box::new(|_| Ok(())));
+        assert!(responder.rotate_signing_key().is_err());
+        assert_eq!(s.read().expect("lock").key_version(), 1);
+    }
+
+    #[test]
     fn alarm_notifies_security_for_each_alarm() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let s = signer();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&count);
-        let rotator = SigningKeyRotator::new(Arc::clone(&s), Box::new(|| Ok((2, [0xC7; 32]))));
+        let rotator = SigningKeyRotator::new(Arc::clone(&s), Box::new(|| Ok([0xC7; 32])));
         let responder = AlarmResponder::new(
             rotator,
             Box::new(move |_| {

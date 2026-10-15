@@ -100,7 +100,10 @@ automated. Review this runbook before any deployment.
 ## 2. Keys
 
 - **Token signing key.** Held in gateway RAM. Rotation is `SigningKeyRotator`, which
-  invalidates every outstanding token at once. **GAP:** there is no key-delivery
+  invalidates every outstanding token at once. The node pushes the new key to each gateway's
+  alarm listener before it switches, so a canary alarm reaches every gateway. Rotation is not
+  durable: after a restart, the node and the gateways reload keys from provisioning, so restart
+  them from the same key set. A gateway that restarts alone fails closed. **GAP:** there is no key-delivery
   mechanism yet. Keys must be delivered RAM-only at boot (see DECISIONS.md, Keys).
 - **Derivation key** (FragmentId). Must never be persisted by the shredder, the
   assembler, or the vault. **GAP:** provisioning is not built.
@@ -113,7 +116,10 @@ automated. Review this runbook before any deployment.
 When the canary detects a canary FragmentId being read through the vault router:
 
 1. **Automatic:** `AlarmGate::handle` rotates the signing key and invalidates all
-   tokens. The gate then disarms, so repeated hits do not rotate again.
+   tokens. The new key is pushed to every gateway alarm listener before this node switches.
+   If a push fails, the node keeps its old key and the gate stays armed, and the next monitor
+   pass retries. The gate disarms once the rotation completes, so repeated hits do not rotate
+   again.
 2. **Automatic:** `Responder::notify_security` is called for each alarm. The alert log
    (`AlertLog`, written by `Alarm::record`) is the channel. **GAP:** a pager or SIEM does
    not tail that file yet, and webhook and email delivery are not built. Until they are,

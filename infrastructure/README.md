@@ -48,10 +48,10 @@ The policies are meant to run as an OPA or Gatekeeper validating webhook.
    Progress: the gateway is its own binary (`tpt-shatter-gateway-service`). It has no vault,
    assembler, shredder, or canary crates in its normal dependency tree. It reads records from
    the assembler service over mTLS, and records reads on its own audit chain under its own key.
-   It refuses to start unless `acknowledge_canary_gap` is set, because canary alarms do not
-   revoke its tokens yet (DECISIONS.md, "Gateway service"). Not deployed: this directory has
-   no gateway or assembler workload yet. Add them to the private and edge namespaces once
-   alarm propagation is decided.
+   Canary alarms reach the gateway through its alarm listener (mTLS, management network). The
+   node pushes a new signing key there when it fires. Still open before the split runs on
+   its own host: the assembler service does not observe canary reads (DECISIONS.md, "Canary
+   alarm propagation"). Not deployed: this directory has no gateway or assembler workload yet.
 
 2. **Spec 6.2 forbids persistent volumes on the assembler host, but the node needs disk.**
    The audit chain, the orphan queue, and the analytics log live in `state_dir`. The

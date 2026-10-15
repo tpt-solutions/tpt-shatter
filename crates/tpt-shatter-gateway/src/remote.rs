@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
-//! The link from the gateway to the assembler service, over mTLS.
+//! The links between the gateway and its peers, over mTLS.
 //!
-//! The gateway is the only client. It sends a shard, and the assembler answers with the
-//! record as `{"fields": {name: value}}`, or with an error code. A failure that names a
-//! vault carries the vault label and nothing else. One request goes on each connection,
-//! with `Connection: close`, and the response is read to its end.
+//! [`RemoteAssembler`] is the gateway's link to the assembler service. The gateway is the
+//! only client. It sends a shard, and the assembler answers with the record as
+//! `{"fields": {name: value}}`, or with an error code. A failure that names a vault carries
+//! the vault label and nothing else.
 //!
-//! [`RemoteAssembler`] implements [`RecordSource`], so the gateway uses it in place of an
-//! in-process assembler. The wire functions here are shared with the assembler service,
-//! so both ends agree on the format.
+//! [`AlarmPeer`] is the node's link to a gateway's alarm listener. It pushes a new token
+//! signing key, so a canary alarm invalidates the tokens on every gateway as well as on the
+//! node. Only the node's client certificate is accepted there.
+//!
+//! Every request opens one connection, sends `Connection: close`, and reads the response to
+//! its end. The wire functions here are shared with the services on the other end, so both
+//! ends agree on the format.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -29,7 +33,7 @@ use crate::RecordSource;
 /// The most response bytes the client reads. A record is bounded by its schema, far below this.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
-/// Builds a TLS 1.3 client configuration. It trusts `ca_pem` for the assembler's certificate,
+/// Builds a TLS 1.3 client configuration. It trusts `ca_pem` for the peer's certificate,
 /// and presents `identity` (certificate chain, then key) when one is given.
 ///
 /// Errors are fixed values. The PEM input is never echoed.
@@ -64,18 +68,19 @@ pub fn client_config(
     Ok(Arc::new(config))
 }
 
-/// A [`RecordSource`] that asks the assembler service for each record over mTLS.
-pub struct RemoteAssembler {
+/// One mTLS destination: an address, the name its certificate must carry, and the
+/// configuration that presents this side's identity.
+#[derive(Clone)]
+pub struct Link {
     addr: String,
     server_name: ServerName<'static>,
     tls: Arc<ClientConfig>,
     timeout: Duration,
 }
 
-impl RemoteAssembler {
-    /// Creates a client for the assembler at `addr` (`host:port`). `server_name` must match
-    /// the name on the assembler's certificate. `timeout` bounds connecting and each read or
-    /// write.
+impl Link {
+    /// Creates a link to `addr` (`host:port`). `server_name` must match the name on the peer's
+    /// certificate. `timeout` bounds connecting and each read or write.
     pub fn new(
         addr: &str,
         server_name: &str,
@@ -92,7 +97,9 @@ impl RemoteAssembler {
         })
     }
 
-    fn exchange(&self, request: &[u8]) -> Result<(u16, Vec<u8>), ShatterError> {
+    /// Sends one request and returns the peer's status and body. A peer that closes without
+    /// answering, such as one that refused our certificate, is `ServiceUnavailable`.
+    pub fn exchange(&self, request: &[u8]) -> Result<(u16, Vec<u8>), ShatterError> {
         let addr = self
             .addr
             .to_socket_addrs()
@@ -136,6 +143,25 @@ impl RemoteAssembler {
     }
 }
 
+/// A [`RecordSource`] that asks the assembler service for each record over mTLS.
+pub struct RemoteAssembler {
+    link: Link,
+}
+
+impl RemoteAssembler {
+    /// Creates a client for the assembler at `addr`. See [`Link::new`] for the arguments.
+    pub fn new(
+        addr: &str,
+        server_name: &str,
+        tls: Arc<ClientConfig>,
+        timeout: Duration,
+    ) -> Result<Self, ShatterError> {
+        Ok(Self {
+            link: Link::new(addr, server_name, tls, timeout)?,
+        })
+    }
+}
+
 impl RecordSource for RemoteAssembler {
     fn fetch(&self, shard: &ShardKey) -> Result<Record, ShatterError> {
         let request = format!(
@@ -143,7 +169,7 @@ impl RecordSource for RemoteAssembler {
             RECORD_PATH,
             shard_hex(shard)
         );
-        let (status, body) = self.exchange(request.as_bytes())?;
+        let (status, body) = self.link.exchange(request.as_bytes())?;
         if status == 200 {
             decode_record(&body)
         } else {
@@ -152,10 +178,53 @@ impl RecordSource for RemoteAssembler {
     }
 }
 
+/// Pushes a new token signing key to a gateway's alarm listener, over mTLS. The listener
+/// accepts only the node's client certificate.
+#[derive(Clone)]
+pub struct AlarmPeer {
+    link: Link,
+}
+
+impl AlarmPeer {
+    /// Creates a client for the alarm listener at `addr`. See [`Link::new`] for the arguments.
+    pub fn new(
+        addr: &str,
+        server_name: &str,
+        tls: Arc<ClientConfig>,
+        timeout: Duration,
+    ) -> Result<Self, ShatterError> {
+        Ok(Self {
+            link: Link::new(addr, server_name, tls, timeout)?,
+        })
+    }
+
+    /// Asks the peer to install `key` as `key_version`. Succeeds only when the peer accepts it.
+    /// A peer that already holds that version or a later one answers `409`, which is
+    /// `InvalidParameter` here.
+    pub fn push(&self, key_version: u32, key: &[u8; 32]) -> Result<(), ShatterError> {
+        let body = encode_rotation(key_version, key);
+        let head = format!(
+            "POST {ALARM_PATH} HTTP/1.1\r\nHost: alarm\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut request = head.into_bytes();
+        request.extend_from_slice(&body);
+        let (status, _) = self.link.exchange(&request)?;
+        match status {
+            204 => Ok(()),
+            409 => Err(ShatterError::InvalidParameter),
+            _ => Err(ShatterError::Internal),
+        }
+    }
+}
+
 /// The path prefix for a record request. The shard's hex follows it.
 pub const RECORD_PATH: &str = "/v1/records/";
 
-/// Any failure to reach or talk to the assembler is the same error to the caller.
+/// The path of the alarm listener's rotation endpoint.
+pub const ALARM_PATH: &str = "/v1/alarm";
+
+/// Any failure to reach or talk to a peer is the same error to the caller.
 fn unavailable<E>(_: E) -> ShatterError {
     ShatterError::ServiceUnavailable
 }
@@ -271,6 +340,36 @@ pub fn decode_error(body: &[u8]) -> ShatterError {
     }
 }
 
+/// Encodes a rotation as `{"key_version": n, "key": "<64 hex>"}`.
+#[must_use]
+pub fn encode_rotation(key_version: u32, key: &[u8; 32]) -> Vec<u8> {
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    serde_json::to_vec(&json!({ "key_version": key_version, "key": hex })).unwrap_or_default()
+}
+
+/// Decodes a rotation. The key must be 64 hex characters, and the version must fit in 32 bits.
+pub fn decode_rotation(body: &[u8]) -> Result<(u32, [u8; 32]), ShatterError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| ShatterError::InvalidParameter)?;
+    let version = value
+        .get("key_version")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or(ShatterError::InvalidParameter)?;
+    let hex = value
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or(ShatterError::InvalidParameter)?;
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Err(ShatterError::InvalidParameter);
+    }
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+            .map_err(|_| ShatterError::InvalidParameter)?;
+    }
+    Ok((version, key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +429,19 @@ mod tests {
         assert_eq!(hex.len(), 64);
         assert!(hex.starts_with("abab"));
         assert_eq!(shard_hex(&ShardKey::from_hex(&hex).expect("parse")), hex);
+    }
+
+    #[test]
+    fn a_rotation_round_trips_and_a_bad_one_is_refused() {
+        let key = [0x3C; 32];
+        let (version, back) = decode_rotation(&encode_rotation(7, &key)).expect("decode");
+        assert_eq!((version, back), (7, key));
+        assert!(decode_rotation(br#"{"key_version":1,"key":"abc"}"#).is_err());
+        assert!(decode_rotation(br#"{"key_version":-1,"key":"00"}"#).is_err());
+        let too_big = format!(
+            r#"{{"key_version":4294967296,"key":"{}"}}"#,
+            "00".repeat(32)
+        );
+        assert!(decode_rotation(too_big.as_bytes()).is_err());
     }
 }

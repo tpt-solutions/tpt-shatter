@@ -19,7 +19,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -30,9 +29,10 @@ use tpt_shatter_common::{
     AlertLog, AuditRecord, Record, RetentionPolicy, ShardKey, ShatterError, ShatterSchema, VaultId,
     report,
 };
+use tpt_shatter_gateway::remote::client_config;
 use tpt_shatter_gateway::{
-    AccessAudit, AlarmResponder, Gateway, HttpConfig, RateLimiter, RecordSink, RecordSource,
-    Shared, SigningKeyRotator, WriteHandler, Writer,
+    AccessAudit, AlarmPeer, AlarmResponder, Gateway, HttpConfig, RateLimiter, RecordSink,
+    RecordSource, Shared, SigningKeyRotator, WriteHandler, Writer,
 };
 use tpt_shatter_shredder::{EraseReport, OrphanStore, Shredder, erase};
 use tpt_shatter_vault_service::{RemoteVault, client_tls_from_files};
@@ -196,6 +196,41 @@ pub struct Config {
     /// Put it on the management network. It uses the same TLS rules as the read path.
     #[serde(default)]
     pub metrics_listen: Option<String>,
+    /// Where to push a new signing key after a canary alarm. Absent means the alarm rotates
+    /// this node's key only, and gateways on other hosts are not told.
+    #[serde(default)]
+    pub gateway_alarm: Option<GatewayAlarm>,
+}
+
+/// The gateways that receive a new signing key when a canary alarm fires.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAlarm {
+    /// One entry per gateway alarm listener.
+    pub peers: Vec<AlarmPeerConfig>,
+    /// CA that the gateways' alarm certificates must chain to (PEM).
+    pub ca: PathBuf,
+    /// This node's client certificate, presented to every peer (PEM).
+    pub client_cert: PathBuf,
+    /// This node's client private key (PEM).
+    pub client_key: PathBuf,
+    /// Seconds one push may take. Defaults to 5.
+    #[serde(default = "default_alarm_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// One gateway alarm listener.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlarmPeerConfig {
+    /// `host:port` of the gateway's alarm listener.
+    pub addr: String,
+    /// Name the listener's certificate must carry.
+    pub server_name: String,
+}
+
+const fn default_alarm_timeout_secs() -> u64 {
+    5
 }
 
 /// Installs the JSON log subscriber on stderr at INFO and above. The binary calls this once
@@ -405,6 +440,8 @@ pub struct Node {
     vaults: Vec<Arc<FileVault>>,
     retention: RetentionPolicy,
     metrics: Arc<Metrics>,
+    /// Clients for the gateways' alarm listeners. Empty when none are configured.
+    alarm_peers: Vec<AlarmPeer>,
 }
 
 /// Stores a shredded record through the node's shredder and its shared orphan store, and
@@ -549,6 +586,27 @@ impl Node {
             None => None,
         };
 
+        let alarm_peers = match &config.gateway_alarm {
+            Some(alarm) => {
+                let read = |path: &PathBuf| {
+                    std::fs::read(path).map_err(|_| ShatterError::InvalidParameter)
+                };
+                let ca = read(&alarm.ca)?;
+                let cert = read(&alarm.client_cert)?;
+                let key = read(&alarm.client_key)?;
+                let tls = client_config(&ca, Some((&cert, &key)))?;
+                let timeout = Duration::from_secs(alarm.timeout_secs);
+                alarm
+                    .peers
+                    .iter()
+                    .map(|peer| {
+                        AlarmPeer::new(&peer.addr, &peer.server_name, Arc::clone(&tls), timeout)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            None => Vec::new(),
+        };
+
         Ok(Self {
             config,
             schema,
@@ -566,6 +624,7 @@ impl Node {
             vaults,
             retention,
             metrics,
+            alarm_peers,
         })
     }
 
@@ -729,12 +788,13 @@ impl Node {
     /// The alarm response: rotate the token key, then notify. The notification writes the
     /// alarm to the audit chain. The monitor also writes every alarm to the alert log.
     pub fn responder(&self) -> AlarmResponder {
-        let version = Arc::new(AtomicU32::new(1));
-        let next_key = Box::new(move || {
-            let v = version.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok((v, random_key()))
-        });
-        let rotator = SigningKeyRotator::new(Arc::clone(&self.signer), next_key);
+        // The rotator chooses the version and pushes the key to every gateway peer before
+        // switching this node. A failed push leaves the old key in force.
+        let rotator = SigningKeyRotator::with_peers(
+            Arc::clone(&self.signer),
+            Box::new(|| Ok::<[u8; 32], ShatterError>(random_key())),
+            self.alarm_peers.clone(),
+        );
         let audit = Arc::clone(&self.audit);
         let metrics = Arc::clone(&self.metrics);
         let notify = Box::new(move |alarm: &Alarm| {
@@ -963,6 +1023,7 @@ mod tests {
             issuer: None,
             analytics: None,
             metrics_listen: None,
+            gateway_alarm: None,
         }
     }
 
@@ -1700,6 +1761,22 @@ mod tests {
                 "ca":"ca","client_cert":"c","client_key":"k"}"#,
         );
         assert!(partial.is_err(), "a partial name map is refused");
+    }
+
+    #[test]
+    fn gateway_alarm_peers_parse_and_refuse_unknown_fields() {
+        let ok: GatewayAlarm = serde_json::from_str(
+            r#"{"peers":[{"addr":"g1:7445","server_name":"gw"}],
+                "ca":"ca","client_cert":"c","client_key":"k"}"#,
+        )
+        .expect("parses");
+        assert_eq!(ok.peers.len(), 1);
+        assert_eq!(ok.timeout_secs, 5);
+
+        let typo = serde_json::from_str::<GatewayAlarm>(
+            r#"{"peers":[],"ca":"ca","client_cert":"c","client_key":"k","timout_secs":3}"#,
+        );
+        assert!(typo.is_err(), "a misspelled field is refused");
     }
 
     #[test]

@@ -419,3 +419,31 @@ The two open items in "Assembler service and the gateway link" are decided as fo
 - **Shared code moved to common.** `AuditStore`, `keyed_digest`, and `read_key_file` moved
   into `tpt-shatter-common`, so the gateway can use them without depending on the node or
   the vault crates. The old paths re-export them.
+
+## Canary alarm propagation (2026-10-16)
+
+- **Transport and identity.** The node pushes a rotation to each gateway's alarm listener
+  over mTLS HTTP. The listener requires a client certificate that chains to its own
+  `client_ca`, so only the node can reach it. Keep the alarm CA separate from the assembler
+  CA, so a certificate issued for one link does not open the other.
+- **Who chooses the key.** The node generates the new key and pushes it. Each gateway
+  installs it only if its version is newer than the one it holds. A stale version is
+  refused with `409`, so a replayed or reordered push cannot roll a gateway back.
+- **Order of switching.** The node switches only after every peer has accepted. A failed
+  push leaves the node on the old key and the alarm gate armed, so the next monitor pass
+  retries. Peers that already accepted stay on the new key. Their tokens are then refused
+  until the retry completes, which fails closed.
+- **Audit before switch.** A gateway writes the rotation to its audit chain before it
+  changes the key. If the write fails, the key does not change.
+- **Gateway config.** An `alarm` listener satisfies the canary requirement. Without one, the
+  gateway still refuses to start unless `acknowledge_canary_gap` is set.
+- **Open, and stated in the runbook.**
+  - Rotation is not durable. A restart reloads keys from provisioning. The node and every
+    gateway must restart from the same key set, or they disagree and fail closed.
+  - The new key travels inside a JSON body, and the body is parsed without zeroizing.
+    Confidentiality rests on the mTLS link alone.
+  - **Canary detection does not run in the assembler service.** `tpt-shatter-assembler`
+    does not attach `CanaryWatch` to its router, so a canary read made through it raises no
+    alarm. The node detects canary reads only when the node serves them itself. Attach the
+    observer, and give the assembler the canary master key, before the assembler runs on its
+    own host.

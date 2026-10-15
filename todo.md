@@ -188,7 +188,7 @@ Resolve these before the implementation phases that depend on them.
 - [x] Route validated requests to the assembler (gRPC, mTLS) — DONE over HTTP/JSON, not gRPC (prost is Apache-only, see DECISIONS.md): `RemoteAssembler` (gateway) and `tpt-shatter-assembler-service` (mTLS, end-to-end tests). Canary alarm propagation to a split gateway is still open (DECISIONS.md, gateway service)
 - [x] Return responses; uniform error responses that leak nothing
 - [x] Logs only token hashes and metadata
-- [x] Key rotation signal receiver (from canary) with instant effect
+- [x] Key rotation signal receiver (from canary) with instant effect — across processes: the node pushes the new key to each gateway's alarm listener over mTLS, and each gateway installs it only if newer (DECISIONS.md, canary alarm propagation). Not durable across restarts
 - [x] Health/readiness endpoints — `/healthz` and `/readyz` in `http.rs`, tested
 - [x] TLS termination config — `serve_tls` (TLS 1.3, optional mTLS) built on rustls 0.23 + rustls-graviola 0.2.1, tested with real handshakes (`tests/tls.rs`); cert issuance and rotation pending
 - [ ] Verify the gateway has no network path to any vault — PARTIAL: code-level separation done, and the standalone `tpt-shatter-gateway` binary (`tpt-shatter-gateway-service`) has no vault, assembler, shredder, or canary crates in its normal dependency tree. The gateway no longer depends on canary, so its dependency tree has no vault-client, assembler, or shredder (`cargo tree -p tpt-shatter-gateway`). Network isolation is infrastructure work
@@ -206,6 +206,7 @@ Resolve these before the implementation phases that depend on them.
 - [ ] Detect canary FragmentId in query logs — PARTIAL (renamed in scope: in-band, not query logs): `Router::with_observer` + `CanaryWatch` alarm on each observed read or delete of a canary FragmentId; writes and `*_maintenance` paths are not observed, so rotation and erasure do not alarm (tested). `CanaryMonitor::poll` runs the response and logs each alarm, and requeues on failure (tested). `monitor_loop` calls `poll` on a timer; direct file access on the host is not seen
 - [x] Alarm: rotate HMAC signing key, invalidate all tokens: `AlarmResponder` in `tpt-shatter-node` rotates the node's token `Signer` (tested end to end: `a_canary_read_through_the_node_rotates_the_token_key`)
 - [ ] Alarm: notify security (webhook/email/pager integration) — PARTIAL: `AlertLog` (append-only JSON-lines, fsynced, forbids value-bearing keys) is the channel; `Alarm::record` and `run_reaper` write to it (tested). Pager/SIEM tailing of the file and webhook delivery are not built
+- [ ] Canary detection in the assembler service — PARTIAL: the assembler binary does not attach `CanaryWatch`, so a canary read through it raises no alarm. Required before the assembler runs on its own host. The alarm response already reaches the gateways
 - [x] Alarm event logging (event only, never canary values)
 - [x] Rate-limited alarm handling to avoid alert storms; manual re-arm procedure
 - [ ] Management-subnet-only access to vaults and gateway

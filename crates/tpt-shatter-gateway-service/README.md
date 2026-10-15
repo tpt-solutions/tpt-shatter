@@ -17,16 +17,25 @@ Writes are not served here. They stay on the node's ingestion path.
 
 ## Refusals at startup
 
-- `acknowledge_canary_gap` must be `true`. Canary alarms are raised by the node, and its
-  response rotates the node's signing key only. A token minted before the alarm still
-  verifies here, so a canary read does not revoke it. Set the flag only once that is
-  accepted.
+- Without an `alarm` listener, `acknowledge_canary_gap` must be `true`. With one, the flag is not
+  needed. Without the listener, a canary alarm on the node rotates only the node's key, and
+  tokens minted before the alarm still verify here.
 - Unknown config fields, a zero assembler timeout, and any unreadable or badly permissioned
   key file stop the process before it listens.
+
+## Canary alarms
+
+The node pushes a new token signing key to this gateway's alarm listener when its canary
+monitor fires. The listener requires a client certificate that chains to `alarm.client_ca`.
+It installs the key only when the version is newer than the current one, and writes the
+rotation to the audit chain first. Keep the listener on the management network.
 
 ## Known gaps
 
 - Readiness (`/readyz`) reports only that the process is up. Assembler health is not part
   of it.
+- A restart reloads the token key from provisioning. A gateway that restarts without its node
+  disagrees with it on the key, and fails closed until both are reloaded from the same key set.
+- Canary reads made through the assembler service are not detected. See DECISIONS.md.
 - The token key is shared with the node's issuer, so compromising this host forges tokens
   for the key's lifetime. That is the spec's stated limit on the token key (7.2).
