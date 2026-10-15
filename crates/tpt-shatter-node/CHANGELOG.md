@@ -21,3 +21,6 @@ All notable changes to `tpt-shatter-node` are documented here. The format follow
 ### Changed
 - `AuditStore` is re-exported from `tpt-shatter-common`, where it now lives. Its behavior is unchanged.
 - `Node::responder` pushes the new key to every configured gateway before switching this node. The version comes from the signer, not from an in-process counter, so a restarted node does not reuse a version a gateway already holds.
+- `canary_push` (optional config): after each refresh, the monitor pushes the canary list to
+  the assembler's list listener. `push_canary_ids` does the push. A failed push is logged and
+  retried on the next pass.

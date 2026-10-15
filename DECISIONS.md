@@ -471,9 +471,24 @@ The two open items in "Assembler service and the gateway link" are decided as fo
   changed by an assembler alarm, since the node never sees assembler reads.
 
 **Open, and stated in the runbook:**
-- **The list is not transported.** The node and the assembler are on different hosts, so
-  something must copy `canary-ids.txt` across. Until that is built, the assembler must be
-  pointed at a list kept current by hand, and it refuses to start without one.
+- **The list transport is built, with one gap.** See "Canary list transport" below. The node
+  pushes the list to the assembler over mTLS after each refresh. The assembler still refuses
+  to start without a list on disk, so a fresh host needs one bootstrap copy.
+
+## Canary list transport (2026-10-16)
+
+- **Channel.** The node pushes its list text to `POST /v1/canary-ids` on the assembler's
+  list listener (`canary_push` in the assembler config), once per monitor pass. The listener
+  is a second mTLS server with its own client CA, separate from the gateway's record listener.
+  It shares the server certificate. This is the same pattern as the gateway alarm listener.
+- **Order.** The node refreshes its canaries first, then pushes. A failed push is logged and
+  retried on the next pass, and it does not stop the refresh.
+- **Rollback.** The assembler refuses a list older than the one on disk with `409`. Writes are
+  atomic. A held list that cannot be read is not overwritten (`500`).
+- **Gap: bootstrap.** The assembler refuses to start without a list on disk, so a new host
+  needs one copy by hand. Pushes after that keep it current.
+- **Gap: one push at a time.** The list listener serves pushes one at a time. This is fine for
+  one node, which pushes once per pass.
 - **A stale list is logged, not locked.** The assembler checks each pass that the held
   epoch has not run past its end plus a grace period (`canary_stale_grace_secs`, default
   600). It writes `canary_list_stale` to the alert log once per stale stretch and keeps

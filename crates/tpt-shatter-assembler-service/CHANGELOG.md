@@ -21,3 +21,5 @@ All notable changes to `tpt-shatter-assembler-service` are documented here. The 
 - Stale canary lists are logged as `canary_list_stale` once per stale stretch. The check uses
   the new required `canary_period_secs` (must match the node) and `canary_stale_grace_secs`
   (default 600). Serving continues.
+- `canary_push` (optional): a second mTLS listener that accepts the node's canary list at
+  `POST /v1/canary-ids`, with its own client CA. It refuses a list older than the one on disk.

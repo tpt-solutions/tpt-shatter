@@ -224,6 +224,48 @@ pub const RECORD_PATH: &str = "/v1/records/";
 /// The path of the alarm listener's rotation endpoint.
 pub const ALARM_PATH: &str = "/v1/alarm";
 
+/// The path of the assembler's canary list endpoint.
+pub const CANARY_IDS_PATH: &str = "/v1/canary-ids";
+
+/// Pushes the node's canary list to the assembler's list listener, over mTLS. The listener
+/// accepts only the node's client certificate. The list is plain text, in the format of
+/// `tpt_shatter_canary::CanaryIds`.
+#[derive(Clone)]
+pub struct CanaryPeer {
+    link: Link,
+}
+
+impl CanaryPeer {
+    /// Creates a client for the list listener at `addr`. See [`Link::new`] for the arguments.
+    pub fn new(
+        addr: &str,
+        server_name: &str,
+        tls: Arc<ClientConfig>,
+        timeout: Duration,
+    ) -> Result<Self, ShatterError> {
+        Ok(Self {
+            link: Link::new(addr, server_name, tls, timeout)?,
+        })
+    }
+
+    /// Sends `list` to the assembler. Succeeds only when the assembler accepts it. An assembler
+    /// that already holds a later epoch answers `409`, which is `InvalidParameter` here.
+    pub fn push(&self, list: &str) -> Result<(), ShatterError> {
+        let head = format!(
+            "POST {CANARY_IDS_PATH} HTTP/1.1\r\nHost: canary\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            list.len()
+        );
+        let mut request = head.into_bytes();
+        request.extend_from_slice(list.as_bytes());
+        let (status, _) = self.link.exchange(&request)?;
+        match status {
+            204 => Ok(()),
+            409 => Err(ShatterError::InvalidParameter),
+            _ => Err(ShatterError::Internal),
+        }
+    }
+}
+
 /// Any failure to reach or talk to a peer is the same error to the caller.
 fn unavailable<E>(_: E) -> ShatterError {
     ShatterError::ServiceUnavailable

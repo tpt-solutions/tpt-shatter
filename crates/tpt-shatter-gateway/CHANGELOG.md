@@ -27,3 +27,5 @@ All notable changes to `tpt-shatter-gateway` are documented here. The format fol
 - `SigningKeyRotator` takes a `NextKey` that returns key bytes only. The rotator chooses the version: it is one above the highest version this side has attempted or installed, so a retry after a partial failure is never stale to a peer that took the earlier try. **Breaking** for callers that passed `(version, key)`.
 - `SigningKeyRotator::with_peers` pushes the new key to every peer first and switches this side only after all of them accept. A failed push returns an error, so the alarm gate stays armed for retry.
 - `RemoteAssembler` is built on a shared `Link`. Its behavior is unchanged.
+- `CanaryPeer` and `CANARY_IDS_PATH` in `remote`: the node's client for the assembler's canary
+  list listener, over mTLS.

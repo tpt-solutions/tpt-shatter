@@ -31,7 +31,7 @@ use tpt_shatter_common::{
     AlertLog, AuditRecord, Record, RetentionPolicy, ShardKey, ShatterError, ShatterSchema, VaultId,
     report,
 };
-use tpt_shatter_gateway::remote::client_config;
+use tpt_shatter_gateway::remote::{CanaryPeer, client_config};
 use tpt_shatter_gateway::{
     AccessAudit, AlarmPeer, AlarmResponder, Gateway, HttpConfig, RateLimiter, RecordSink,
     RecordSource, Shared, SigningKeyRotator, WriteHandler, Writer,
@@ -204,6 +204,29 @@ pub struct Config {
     /// this node's key only, and gateways on other hosts are not told.
     #[serde(default)]
     pub gateway_alarm: Option<GatewayAlarm>,
+    /// Where to push the canary list after each refresh. Absent means the list stays in the
+    /// state directory, and must be copied to the assembler by hand.
+    #[serde(default)]
+    pub canary_push: Option<CanaryPush>,
+}
+
+/// The assembler's canary list listener, which receives the list after each refresh.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryPush {
+    /// `host:port` of the assembler's canary list listener.
+    pub addr: String,
+    /// Name the listener's certificate must carry.
+    pub server_name: String,
+    /// CA that the assembler's certificate must chain to (PEM).
+    pub ca: PathBuf,
+    /// This node's client certificate, presented to the listener (PEM).
+    pub client_cert: PathBuf,
+    /// This node's client private key (PEM).
+    pub client_key: PathBuf,
+    /// Seconds one push may take. Defaults to 5.
+    #[serde(default = "default_alarm_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 /// The gateways that receive a new signing key when a canary alarm fires.
@@ -446,6 +469,8 @@ pub struct Node {
     metrics: Arc<Metrics>,
     /// Clients for the gateways' alarm listeners. Empty when none are configured.
     alarm_peers: Vec<AlarmPeer>,
+    /// The client for the assembler's canary list listener. `None` when no push is configured.
+    canary_peer: Option<CanaryPeer>,
 }
 
 /// Stores a shredded record through the node's shredder and its shared orphan store, and
@@ -611,6 +636,25 @@ impl Node {
             None => Vec::new(),
         };
 
+        let canary_peer = match &config.canary_push {
+            Some(push) => {
+                let read = |path: &PathBuf| {
+                    std::fs::read(path).map_err(|_| ShatterError::InvalidParameter)
+                };
+                let tls = client_config(
+                    &read(&push.ca)?,
+                    Some((&read(&push.client_cert)?, &read(&push.client_key)?)),
+                )?;
+                Some(CanaryPeer::new(
+                    &push.addr,
+                    &push.server_name,
+                    tls,
+                    Duration::from_secs(push.timeout_secs),
+                )?)
+            }
+            None => None,
+        };
+
         Ok(Self {
             config,
             schema,
@@ -629,6 +673,7 @@ impl Node {
             retention,
             metrics,
             alarm_peers,
+            canary_peer,
         })
     }
 
@@ -718,6 +763,18 @@ impl Node {
         let ids = CanaryIds::from_plan(&self.rotation.plan_at(now)?, self.rotation.epoch(now)?)?;
         ids.write_file(&self.config.state_dir.join(CANARY_IDS))?;
         Ok(changed)
+    }
+
+    /// Pushes the canary list in the state directory to the assembler, when a push is
+    /// configured. The monitor loop calls it after each refresh, so a failed push is retried on
+    /// the next pass. The assembler refuses a list older than the one it holds.
+    pub fn push_canary_ids(&self) -> Result<(), ShatterError> {
+        let Some(peer) = &self.canary_peer else {
+            return Ok(());
+        };
+        let text = fs::read_to_string(self.config.state_dir.join(CANARY_IDS))
+            .map_err(|_| ShatterError::Internal)?;
+        peer.push(&text)
     }
 
     /// Erases every fragment for `shard` (GDPR erasure). The request is recorded in the audit
@@ -1035,6 +1092,7 @@ mod tests {
             analytics: None,
             metrics_listen: None,
             gateway_alarm: None,
+            canary_push: None,
         }
     }
 

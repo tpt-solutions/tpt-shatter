@@ -233,6 +233,9 @@ fn monitor_loop(node: &Node, interval: Duration, stop: &AtomicBool) {
         if let Err(e) = node.refresh_canaries(now) {
             error!(error = %e, "canary refresh failed");
         }
+        if let Err(e) = node.push_canary_ids() {
+            error!(error = %e, "canary list push failed");
+        }
         match monitor.poll(&responder, now) {
             Ok(Outcome::Fired { alarms }) => {
                 warn!(alarms, "canary alarm responded");

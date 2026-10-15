@@ -138,9 +138,10 @@ When the canary detects a canary FragmentId being read through the vault router:
    `CanaryWatcher`, not by the node. The first hit locks the assembler, and every read is
    refused until the assembler is restarted, so the gateway also stops serving reads. The
    restart is the re-arm step: read the `alert_log` file named in the assembler's config first. The
-   lock does not rotate the token key. **GAP:** the node's canary list
-   (`state_dir/canary-ids.txt`) must be copied to the assembler host by hand. The assembler
-   refuses to start without it. If the list goes stale, the assembler logs
+   lock does not rotate the token key. The node pushes its canary list to the assembler after
+   each refresh, when `canary_push` is configured. **GAP:** a new assembler host needs one copy
+   of `state_dir/canary-ids.txt` by hand, because the assembler refuses to start without it. If
+   the list goes stale, the assembler logs
    `canary_list_stale` and keeps serving, so treat that entry as a node fault: the node has
    stopped refreshing its canaries.
 

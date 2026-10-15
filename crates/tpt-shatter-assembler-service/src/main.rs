@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tpt_shatter_assembler_service::canary::Freshness;
-use tpt_shatter_assembler_service::{AssemblerSource, CanaryWatcher, LockedSource, serve};
+use tpt_shatter_assembler_service::{
+    AssemblerSource, CanaryWatcher, LockedSource, serve, serve_canary_list,
+};
 use tpt_shatter_canary::{CanaryIds, CanaryWatch};
 use tpt_shatter_common::{ShatterSchema, VaultId};
 use tpt_shatter_gateway::RecordSource;
@@ -45,6 +47,10 @@ struct Config {
     /// node's pass after a boundary. Defaults to 600.
     #[serde(default = "default_stale_grace_secs")]
     canary_stale_grace_secs: u64,
+    /// Where the node pushes its canary list. Absent means the list is copied to
+    /// `canary_ids_file` by hand, as before.
+    #[serde(default)]
+    canary_push: Option<CanaryPushConfig>,
     /// Server certificate chain (PEM).
     tls_cert: PathBuf,
     /// Server private key (PEM).
@@ -97,6 +103,16 @@ struct ServerNames {
 
 fn default_deadline_secs() -> u64 {
     3
+}
+
+/// The listener that accepts canary list pushes from the node.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanaryPushConfig {
+    /// Address to listen on, for example `0.0.0.0:7445`. Keep it off the gateway's network.
+    listen: String,
+    /// CA that the node's client certificate must chain to. Separate from the gateway's CA.
+    client_ca: PathBuf,
 }
 
 fn default_monitor_secs() -> u64 {
@@ -218,6 +234,27 @@ fn run(config_path: &Path) -> Result<(), String> {
         Some(&fs::read(&config.client_ca).map_err(|_| "client_ca: unreadable".to_owned())?),
     )
     .map_err(|_| "tls: refused".to_owned())?;
+
+    if let Some(push) = &config.canary_push {
+        // The list listener accepts only the node, so it uses the node's CA, not the gateway's.
+        let push_tls = server_config(
+            &fs::read(&config.tls_cert).map_err(|_| "tls_cert: unreadable".to_owned())?,
+            &fs::read(&config.tls_key).map_err(|_| "tls_key: unreadable".to_owned())?,
+            Some(
+                &fs::read(&push.client_ca)
+                    .map_err(|_| "canary client_ca: unreadable".to_owned())?,
+            ),
+        )
+        .map_err(|_| "canary tls: refused".to_owned())?;
+        let push_listener =
+            TcpListener::bind(&push.listen).map_err(|e| format!("canary listen: {e}"))?;
+        let list = config.canary_ids_file.clone();
+        thread::spawn(move || {
+            if let Err(e) = serve_canary_list(push_listener, push_tls, list) {
+                eprintln!("tpt-shatter-assembler: canary list listener stopped: {e}");
+            }
+        });
+    }
 
     let listener = TcpListener::bind(&config.listen).map_err(|e| format!("listen: {e}"))?;
     serve(listener, tls, source).map_err(|_| "server stopped".to_owned())
