@@ -471,9 +471,9 @@ The two open items in "Assembler service and the gateway link" are decided as fo
   changed by an assembler alarm, since the node never sees assembler reads.
 
 **Open, and stated in the runbook:**
-- **The list transport is built, with one gap.** See "Canary list transport" below. The node
-  pushes the list to the assembler over mTLS after each refresh. The assembler still refuses
-  to start without a list on disk, so a fresh host needs one bootstrap copy.
+- **The list transport is built.** See "Canary list transport" below. The node pushes the
+  list to the assembler over mTLS after each refresh. A fresh assembler host needs no copy:
+  it starts awaiting its first list, and refuses reads until one arrives.
 
 ## Canary list transport (2026-10-16)
 
@@ -485,8 +485,15 @@ The two open items in "Assembler service and the gateway link" are decided as fo
   retried on the next pass, and it does not stop the refresh.
 - **Rollback.** The assembler refuses a list older than the one on disk with `409`. Writes are
   atomic. A held list that cannot be read is not overwritten (`500`).
-- **Gap: bootstrap.** The assembler refuses to start without a list on disk, so a new host
-  needs one copy by hand. Pushes after that keep it current.
+- **Bootstrap: awaiting, not refusing.** Starting with no list on disk is not an error. The
+  assembler watches nothing and refuses every read (`ServiceUnavailable`) until the first push
+  writes a list. A missing list is not logged as a rejection, since waiting is expected. A list
+  that is present but unreadable still stops startup, because that is a fault, not a wait.
+  Why this and not the alternatives: refusing to start needed a hand copy on every new host,
+  and serving unwatched would leave the first epoch's reads undetected. Refusing reads
+  until the first push keeps both properties.
+- **Alarm and waiting are separate.** `ReadGate` tracks each reason to refuse. A list arriving
+  clears only the waiting state, so it can never clear an alarm.
 - **Gap: one push at a time.** The list listener serves pushes one at a time. This is fine for
   one node, which pushes once per pass.
 - **A stale list is logged, not locked.** The assembler checks each pass that the held

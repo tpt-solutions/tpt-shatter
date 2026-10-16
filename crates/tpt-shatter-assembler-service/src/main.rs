@@ -8,14 +8,12 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use tpt_shatter_assembler_service::canary::Freshness;
 use tpt_shatter_assembler_service::{
-    AssemblerSource, CanaryWatcher, LockedSource, serve, serve_canary_list,
+    AssemblerSource, CanaryWatcher, Freshness, LockedSource, ReadGate, serve, serve_canary_list,
 };
 use tpt_shatter_canary::{CanaryIds, CanaryWatch};
 use tpt_shatter_common::{ShatterSchema, VaultId};
@@ -157,11 +155,22 @@ fn run(config_path: &Path) -> Result<(), String> {
         ShatterSchema::load_json_file(&config.schema).map_err(|_| "schema: refused".to_owned())?;
     let derivation = read_key_file(&config.derivation_key_file)
         .map_err(|_| "derivation key: refused".to_owned())?;
-    // Refuse to start without the canary list, so reads are never served unwatched.
-    let ids = CanaryIds::read_file(&config.canary_ids_file)
-        .map_err(|_| "canary ids: refused".to_owned())?;
-    let watch = Arc::new(CanaryWatch::from_ids(&ids));
-    let locked = Arc::new(AtomicBool::new(false));
+    // With no list on disk yet, start awaiting the node's first push and refuse reads until it
+    // arrives. A list that is present but unreadable still refuses to start.
+    let awaiting = !config.canary_ids_file.exists();
+    let ids = if awaiting {
+        None
+    } else {
+        Some(
+            CanaryIds::read_file(&config.canary_ids_file)
+                .map_err(|_| "canary ids: refused".to_owned())?,
+        )
+    };
+    let watch = Arc::new(match &ids {
+        Some(ids) => CanaryWatch::from_ids(ids),
+        None => CanaryWatch::unwatched(),
+    });
+    let gate = Arc::new(ReadGate::new(awaiting));
 
     let vaults = &config.remote_vaults;
     let client_tls = client_tls_from_files(&vaults.ca, &vaults.client_cert, &vaults.client_key)
@@ -204,14 +213,14 @@ fn run(config_path: &Path) -> Result<(), String> {
         derivation,
         Duration::from_secs(config.read_deadline_secs),
     ));
-    let source = Arc::new(LockedSource::new(inner, Arc::clone(&locked)));
+    let source = Arc::new(LockedSource::new(inner, Arc::clone(&gate)));
 
     let mut watcher = CanaryWatcher::new(
         config.canary_ids_file.clone(),
-        &ids,
+        ids.as_ref(),
         Arc::clone(&watch),
         &config.alert_log,
-        Arc::clone(&locked),
+        Arc::clone(&gate),
         Freshness {
             period_secs: config.canary_period_secs,
             grace_secs: config.canary_stale_grace_secs,

@@ -23,7 +23,7 @@ use tpt_shatter_assembler::assemble_with_deadline;
 
 pub mod canary;
 pub mod canary_push;
-pub use canary::{CanaryWatcher, LockedSource};
+pub use canary::{CanaryWatcher, Freshness, LockedSource, ReadGate};
 pub use canary_push::serve_canary_list;
 use tpt_shatter_common::{Record, ShardKey, ShatterError, ShatterSchema};
 use tpt_shatter_gateway::RecordSource;

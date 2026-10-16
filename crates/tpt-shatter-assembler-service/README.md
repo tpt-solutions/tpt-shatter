@@ -16,8 +16,8 @@ Runs the assembler as its own service, so the gateway can run on a separate host
 The client side is `tpt_shatter_gateway::RemoteAssembler`. The gateway needs no vault
 client and no derivation key. See `infrastructure/README.md` for where this runs.
 
-The node pushes its canary ID list here over mTLS, through `canary_push`. A fresh host needs
-one bootstrap copy of the list, because startup needs it. A stale list is logged as
+The node pushes its canary ID list here over mTLS, through `canary_push`. A fresh host starts
+with no list and refuses reads until the first push arrives. A stale list is logged as
 `canary_list_stale`, not locked. A canary alarm here locks reads but
 does not rotate the token key, because this host holds no signing key. See DECISIONS.md,
 canary detection on the assembler.

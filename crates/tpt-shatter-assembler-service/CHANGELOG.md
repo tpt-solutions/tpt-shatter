@@ -23,3 +23,6 @@ All notable changes to `tpt-shatter-assembler-service` are documented here. The 
   (default 600). Serving continues.
 - `canary_push` (optional): a second mTLS listener that accepts the node's canary list at
   `POST /v1/canary-ids`, with its own client CA. It refuses a list older than the one on disk.
+- An assembler with no canary list yet starts awaiting the node's first push. It refuses reads
+  until a list arrives. `ReadGate` tracks this separately from the alarm lock. A list that is
+  present but unreadable still stops startup.

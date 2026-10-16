@@ -40,6 +40,16 @@ impl CanaryWatch {
         })
     }
 
+    /// Watches nothing, until [`CanaryWatch::replace_ids`] supplies a list. Used by a host that
+    /// starts before its first canary list arrives.
+    #[must_use]
+    pub fn unwatched() -> Self {
+        Self {
+            detector: Mutex::new(Detector::from_entries(&[])),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Watches the canaries listed in `ids`. Needs no canary key, so it suits a host that
     /// only reads canaries.
     #[must_use]

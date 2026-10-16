@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
-//! Canary detection on the assembler: a canary read locks the source, a rejected list is
-//! logged, and a stale list is logged once without locking. Uses in-memory vaults and
-//! synthetic data only.
+//! Canary detection on the assembler: a canary read fires the alarm gate, a rejected list is
+//! logged, a stale list is logged once without refusing reads, and an assembler with no list
+//! yet refuses reads until its first list arrives. Uses in-memory vaults and synthetic data
+//! only.
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tpt_shatter_assembler_service::canary::Freshness;
-use tpt_shatter_assembler_service::{AssemblerSource, CanaryWatcher, LockedSource};
+use tpt_shatter_assembler_service::{
+    AssemblerSource, CanaryWatcher, Freshness, LockedSource, ReadGate,
+};
 use tpt_shatter_canary::{CanaryIds, CanaryRotation, CanaryWatch, refresh_canaries};
 use tpt_shatter_common::{SHARD_KEY_LEN, ShardKey, ShatterError, ShatterSchema, VaultId};
 use tpt_shatter_gateway::RecordSource;
@@ -67,13 +68,20 @@ fn watched_router(watch: &Arc<CanaryWatch>) -> Arc<Router> {
     Arc::new(Router::new(guards).expect("router").with_observer(observer))
 }
 
-/// Everything one test needs: the node's epoch-50 canaries injected into a watched router, a
-/// locked source over that router, and a watcher reading the list from `dir`.
+fn freshness() -> Freshness {
+    Freshness {
+        period_secs: WEEK,
+        grace_secs: GRACE,
+    }
+}
+
+/// Everything one test needs: the node's epoch-50 canaries in a watched router, a gated source
+/// over that router, and a watcher reading the list from `list`.
 struct Rig {
     rotation: CanaryRotation,
     plan: tpt_shatter_canary::CanaryPlan,
     source: LockedSource,
-    locked: Arc<AtomicBool>,
+    gate: Arc<ReadGate>,
     watcher: CanaryWatcher,
     alerts: PathBuf,
     list: PathBuf,
@@ -92,33 +100,29 @@ fn rig(name: &str) -> Rig {
     let router = watched_router(&watch);
     refresh_canaries(&rotation, &schema(), &router, &DERIVATION, None, NOW).expect("refresh");
 
-    let locked = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(ReadGate::new(false));
     let inner: Arc<dyn RecordSource> = Arc::new(AssemblerSource::new(
         Arc::new(schema()),
         Arc::clone(&router),
         DERIVATION,
         Duration::from_secs(3),
     ));
-    let source = LockedSource::new(inner, Arc::clone(&locked));
+    let source = LockedSource::new(inner, Arc::clone(&gate));
     let alerts = dir.join("alerts.jsonl");
-    let freshness = Freshness {
-        period_secs: WEEK,
-        grace_secs: GRACE,
-    };
     let watcher = CanaryWatcher::new(
         list.clone(),
-        &ids,
+        Some(&ids),
         watch,
         &alerts,
-        Arc::clone(&locked),
-        freshness,
+        Arc::clone(&gate),
+        freshness(),
     )
     .expect("watcher");
     Rig {
         rotation,
         plan,
         source,
-        locked,
+        gate,
         watcher,
         alerts,
         list,
@@ -126,17 +130,17 @@ fn rig(name: &str) -> Rig {
 }
 
 #[test]
-fn a_canary_read_through_the_source_locks_it_and_refuses_later_reads() {
-    let mut rig = rig("lock");
+fn a_canary_read_through_the_source_fires_the_gate_and_refuses_later_reads() {
+    let mut rig = rig("alarm");
     rig.watcher.pass(NOW).expect("quiet pass");
-    assert!(!rig.locked.load(Ordering::SeqCst));
+    assert!(!rig.gate.refuses());
 
     // Reading a canary through the source is observed by the router's watch.
     let canary = rig.plan.shard(0).expect("shard");
     let _ = rig.source.fetch(&canary);
     rig.watcher.pass(NOW + 1).expect("alarm pass");
 
-    assert!(rig.locked.load(Ordering::SeqCst));
+    assert!(rig.gate.is_alarmed());
     assert_eq!(
         rig.source.fetch(&canary).err(),
         Some(ShatterError::ServiceUnavailable)
@@ -164,7 +168,7 @@ fn an_older_list_is_refused_and_the_held_canaries_stay_in_force() {
     let canary = rig.plan.shard(1).expect("shard");
     let _ = rig.source.fetch(&canary);
     let _ = rig.watcher.pass(NOW + 1);
-    assert!(rig.locked.load(Ordering::SeqCst));
+    assert!(rig.gate.is_alarmed());
 }
 
 #[test]
@@ -187,12 +191,77 @@ fn a_stale_list_is_logged_once_and_serving_continues() {
         .expect("second stale pass");
     let log = fs::read_to_string(&rig.alerts).expect("alert log");
     assert_eq!(log.matches("canary_list_stale").count(), 1, "{log}");
-    assert!(!rig.locked.load(Ordering::SeqCst), "stale must not lock");
+    assert!(!rig.gate.is_alarmed(), "stale must not fire the gate");
     // The source still serves. This shard has no fragments, so the read fails for that reason,
-    // not the lock's ServiceUnavailable.
+    // not the gate's ServiceUnavailable.
     let unknown = ShardKey::from_bytes([0x42; SHARD_KEY_LEN]);
     assert_ne!(
         rig.source.fetch(&unknown).err(),
+        Some(ShatterError::ServiceUnavailable)
+    );
+}
+
+#[test]
+fn an_assembler_with_no_list_refuses_reads_until_the_first_list_arrives() {
+    let rotation = CanaryRotation::new(MASTER, DERIVATION, 2, WEEK).expect("rotation");
+    let epoch = rotation.epoch(NOW).expect("epoch");
+    let plan = rotation.plan_at(NOW).expect("plan");
+    let ids = CanaryIds::from_plan(&plan, epoch).expect("ids");
+    let dir = temp_dir("awaiting");
+    let list = dir.join("canary-ids.txt");
+    let alerts = dir.join("alerts.jsonl");
+
+    // Start with no list on disk: nothing is watched, and every read is refused.
+    let watch = Arc::new(CanaryWatch::unwatched());
+    let router = watched_router(&watch);
+    refresh_canaries(&rotation, &schema(), &router, &DERIVATION, None, NOW).expect("refresh");
+    let gate = Arc::new(ReadGate::new(true));
+    let inner: Arc<dyn RecordSource> = Arc::new(AssemblerSource::new(
+        Arc::new(schema()),
+        Arc::clone(&router),
+        DERIVATION,
+        Duration::from_secs(3),
+    ));
+    let source = LockedSource::new(inner, Arc::clone(&gate));
+    let mut watcher = CanaryWatcher::new(
+        list.clone(),
+        None,
+        Arc::clone(&watch),
+        &alerts,
+        Arc::clone(&gate),
+        freshness(),
+    )
+    .expect("watcher");
+
+    let unknown = ShardKey::from_bytes([0x42; SHARD_KEY_LEN]);
+    watcher.pass(NOW).expect("waiting pass");
+    assert!(gate.is_awaiting_list());
+    assert_eq!(
+        source.fetch(&unknown).err(),
+        Some(ShatterError::ServiceUnavailable)
+    );
+    let log = fs::read_to_string(&alerts).unwrap_or_default();
+    assert!(
+        !log.contains("canary_list_rejected"),
+        "waiting is not a rejection: {log}"
+    );
+
+    // The node's first push writes the list. The next pass picks it up and serving resumes.
+    ids.write_file(&list).expect("first list");
+    watcher.pass(NOW + 1).expect("loading pass");
+    assert!(!gate.is_awaiting_list());
+    assert_ne!(
+        source.fetch(&unknown).err(),
+        Some(ShatterError::ServiceUnavailable)
+    );
+
+    // Once watching, a canary read still fires the alarm gate.
+    let canary = plan.shard(0).expect("shard");
+    let _ = source.fetch(&canary);
+    watcher.pass(NOW + 2).expect("alarm pass");
+    assert!(gate.is_alarmed());
+    assert_eq!(
+        source.fetch(&unknown).err(),
         Some(ShatterError::ServiceUnavailable)
     );
 }
